@@ -1,0 +1,147 @@
+# Copyright 2023 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# proto-file: third_party/pcie_lmt/lmt.proto
+# proto-message: LinkMargin
+
+vendor_id: 0x1000
+device_id: 0xc030
+
+bus: 0x81
+bus: 0xa1
+
+################################################################################
+# Lane parameter references:
+# DSP parameters for reference:
+#  lane_parameter: {
+#    num_timing_steps: 16
+#    max_timing_offset: 25
+#    ind_left_right_timing: true
+#    voltage_supported: true
+#    num_voltage_steps: 63
+#    max_voltage_offset: 13
+#    ind_up_down_voltage: true
+#    max_lanes: 15
+#  }
+#
+# Retimer parameters
+#  lane_parameter: {
+#    num_timing_steps: 14
+#    max_timing_offset: 40
+#    sampling_rate_timing: 31
+#    ind_left_right_timing: true
+#    voltage_supported: true
+#    num_voltage_steps: 108
+#    max_voltage_offset: 20
+#    sampling_rate_voltage: 31
+#    ind_up_down_voltage: true
+#    ind_error_sampler: true
+#    max_lanes: 7
+#    sample_reporting_method: true
+#  }
+#
+# USP parameters for reference:
+#  lane_parameter:  {
+#    num_timing_steps:  31
+#    max_timing_offset:  50
+#    ind_left_right_timing:  true
+#    voltage_supported:  true
+#    num_voltage_steps:  127
+#    max_voltage_offset:  49
+#    ind_up_down_voltage:  true
+#    ind_error_sampler:  true
+#    max_lanes:  15
+#  }
+#
+################################################################################
+test_specs: {
+  receiver: R_DSP_A1
+  aspect: M_TIMING
+  samples: 60
+  dwell: 1.5
+  error_limit: 31
+  target_offset: 0
+  lane_number: 1
+}
+test_specs: {
+  receiver: R_DSP_A1
+  aspect: M_VOLTAGE
+  samples: 70
+  dwell: 0.5
+  error_limit: 31
+  start_offset: 0
+  step: 4
+  target_offset: 7
+  lane_number: 2
+  lane_number: 0
+}
+
+# test_specs: {
+#   receiver: R_RTU_B2
+#   aspect: M_TIMING
+#   samples: 110
+#   dwell: 10
+#   error_limit: 31
+#   start_offset: 0
+#   step: 1
+# }
+# test_specs: {
+#   receiver: R_RTU_B2
+#   aspect: M_VOLTAGE
+#   samples: 110
+#   dwell: 10
+#   error_limit: 31
+#   start_offset: 4
+#   step: 1
+# }
+# 
+# test_specs: {
+#   receiver: R_RTD_C3
+#   aspect: M_TIMING
+#   samples: 110
+#   dwell: 10
+#   error_limit: 31
+#   start_offset: 0
+#   step: 1
+# }
+# test_specs: {
+#   receiver: R_RTD_C3
+#   aspect: M_VOLTAGE
+#   samples: 110
+#   dwell: 10
+#   error_limit: 31
+#   start_offset: 4
+#   step: 1
+# }
+
+test_specs: {
+  receiver: R_USP_F6
+  aspect: M_TIMING
+  samples: 50
+  dwell: 3.0
+  error_limit: 0
+  start_offset: 3
+  step: 4
+}
+test_specs: {
+  receiver: R_USP_F6
+  aspect: M_VOLTAGE
+  samples: 50
+  dwell: 3
+  error_limit: 1
+  start_offset: 22
+  step: 5
+  target_offset: 25
+  lane_number: 0
+}

@@ -1,0 +1,164 @@
+// Copyright 2023 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// PCIe LMT (Lane Margin Test) Proto
+// Refer to PCIe Base Specification 5.0
+// section 4.2.13 Lane Margining at Receiver.
+syntax = "proto3";
+
+package lmt_proto;
+
+option go_package = 'lmt_go.proto';
+
+message LinkMarginTest {
+  repeated LinkMargin link_margin = 1;
+}
+
+message LinkMargin {
+  // The following optional fields are use to select PCIe USP in the system
+  // to conduct the link training test.
+  // USPs can be chosen by vendor and device IDs.
+  // The DSP of a link is inferred from the USP.
+  optional uint32 vendor_id = 1;
+  optional uint32 device_id = 2;
+  // Assumes domain==0, device==0, and function=0
+  // USPs can also be chosen by bus numbers with or without the IDs.
+  repeated uint32 bus = 4;
+  optional string usp_bdf = 5;  // reported USP's BDF in the link under test.
+  optional string dsp_bdf = 6;  // reported DSP's BDF in the link under test.
+  optional string message = 7;  // Some info log from testing on a link.
+
+  // Receiver identifier on a link, according to the PCIe Base Spec 5.0
+  // 4.2.13.1. The enumeration corresponds to the 3-bit Receiver Number
+  // encoding.
+  enum ReceiverEnum {
+    R_BROADCAST0 = 0;  // Broadcast
+    R_DSP_A1 = 1;      // Rx(A) (Downstream Port Receiver)
+    R_RTU_B2 = 2;      // Rx(B) (Retimer X or Z Upstream Pseudo Port Receiver)
+    R_RTD_C3 = 3;      // Rx(C) (Retimer X or Z Downstream Pseudo Port Receiver)
+    R_RTU_D4 = 4;      // Rx(D) (Retimer Y Upstream Pseudo Port Receiver)
+    R_RTD_E5 = 5;      // Rx(E) (Retimer Y Downstream Pseudo Port Receiver)
+    R_USP_F6 = 6;      // Rx (F) (Upstream Port Receiver)
+    R_RESERVED = 7;    // Reserved
+  }
+
+  // Voltage or Timing enumeration type.
+  enum MarginAspectEnum {
+    M_UNKNOWN = 0;
+    M_TIMING = 1;
+    M_VOLTAGE = 2;
+  }
+
+  // Use a list of receiver test_specs to support retimers (preferred), and/or
+  // specific USP and DSP test specs (backward compatibility only).
+  repeated TestSpec test_specs = 8;  // A list of receivers to margin.
+  message TestSpec {
+    // Defaults to R_DSP_A1 for a DSP, or R_USP_F6 for a USP.
+    optional ReceiverEnum receiver = 1;
+
+    // Voltage or Timing spec
+    optional MarginAspectEnum aspect = 2;
+
+    // If SampleReportingMethod is count, poll the sample_count to surpass this
+    // specified samples.
+    uint32 samples = 3;  // Sampling Count 0-127 = 3*log2(number of bits N).
+    // If SampleReportingMethod is rate, estimate the time:
+    // time = 2^(samples/3) / ((rate+1)/64) / (16G(gen4) or 32G(gen5))
+    // For 1e12 sample count, samples = 120. time = 62sec at gen4 if rate=63.
+
+    // Margining time is the greater between time and dwell.
+    optional float dwell = 4;  // min number of seconds per margining.
+    uint32 error_limit = 5;    // 0 to 63 max error allowed
+
+    // Bring-up and IST use cases are different:
+    // In IST, the start_offset and step are not specified. The passing
+    // condition is that the number of errors should be no greater than the
+    // error_limit when both samples and dwell are reached at the target_steps.
+    // In Bring-up, ultiple margining points are tested, by stepping from
+    // start_offset to the first failing point, or the target_offset if
+    // specified.
+    optional uint32 start_offset = 6;  // The starting offset in steps.
+    optional uint32 step = 7;
+    optional uint32 target_offset = 8;  // The final offset (in steps) to margin
+
+    // By default, all lanes on a port are tested.
+    // For bring-up use case, margining can be tested only on a single lane.
+    // However, the same lane_number must be specified on both tspec and vspec.
+    repeated uint32 lane_number = 9;  // If specified, only test listed lanes.
+  }
+
+  // Use a list of receiver_lanes to support retimers (preferred).
+  repeated Lane receiver_lanes = 13;  // A list of lanes of receivers.
+  // Below are the test result section organized as Lane:MarginPoint
+  message Lane {
+    uint32 lane_number = 1;       // logical lane number
+    ReceiverEnum receiver = 2;    // The enumerated receiver number.
+    optional TestSpec tspec = 3;  // Inherited and aligned timing TestSpec
+    optional TestSpec vspec = 4;  // Inherited and aligned voltage TestSpec
+
+    // LaneParameter implements PCIe Base Spec 5.0 8.4.4 parameter definitions
+    Parameters lane_parameter = 5;
+    message Parameters {
+      uint32 num_timing_steps = 1;      // Number of Timing Steps 6-63
+      uint32 max_timing_offset = 2;     // Max Timing Offset 20-50
+      uint32 sampling_rate_timing = 3;  // Sampling Rate Timing 0-63:(1-64)/64
+      bool ind_left_right_timing = 4;   // Independent Left/Right Timing
+      bool voltage_supported = 5;     // Whether voltage margining is supported.
+      uint32 num_voltage_steps = 6;   // Number of Voltage Steps 32-127
+      uint32 max_voltage_offset = 7;  // Max Voltage Offset 5-50
+      uint32 sampling_rate_voltage = 8;  // Sampling Rate Voltage 0-63
+      bool ind_up_down_voltage = 9;  // Independent up/down voltage margining.
+      bool ind_error_sampler = 10;   // Independent Error Sampler
+      uint32 max_lanes = 11;         // Max Lanes minus 1: 0-31
+      bool sample_reporting_method = 12;  // rates:1 or count:0
+    }
+
+    repeated MarginPoint timing_margins = 8;   // timing margining points
+    repeated MarginPoint voltage_margins = 9;  // voltage margining points
+    // This message defines a lane margining test point.
+    message MarginPoint {
+      enum DirectionEnum {  // command Margin Payload[7] for V, [6] for T
+        D_UNKNOWN = 0;
+        D_RIGHT = 1;
+        D_LEFT = 2;
+        D_UP = 3;
+        D_DOWN = 4;
+        D_LR = 5;  // Used when t_independent == false
+        D_UD = 6;  // Used when v_independent == false
+      }
+      DirectionEnum direction = 1;
+
+      uint32 steps = 2;  // command Margin Payload[6:0] for V or [5:0] for T
+
+      enum StatusEnum {  // response Margin Payload[7:6]
+        S_UNKNOWN = 0;
+        S_ERROR_OUT = 1;
+        S_SETTING_UP = 2;
+        S_MARGINING = 3;
+        S_NAK = 4;
+      }
+      StatusEnum status = 3;
+
+      uint32 error_count = 4;  // response Margin Payload[5:0]
+      optional uint32 sample_count = 5;
+
+      optional float percent_ui = 6;  // t_max * steps / t_steps [-0.5:+0.5]
+      optional float voltage = 7;     // v_max * steps / v_steps [-0.5V:+0.5V]
+      optional string error = 8;
+      optional string info = 9;  // Info such as max-passing and min-failing.
+    }
+    optional bool pass = 10;
+    optional string extra_info = 11;
+  }
+}
