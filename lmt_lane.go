@@ -311,7 +311,7 @@ func (ln *Lane) MarginLane() error {
 				msg.WriteString(err.Error() + " | ")
 			}
 			passPos = mp.GetStatus() == lmtpb.LinkMargin_Lane_MarginPoint_S_MARGINING
-			if passPos {
+			if passPos && mpFailPos == nil {
 				mpPassPos = mp
 			} else if mpFailPos == nil {
 				mpFailPos = mp
@@ -325,7 +325,7 @@ func (ln *Lane) MarginLane() error {
 				}
 				passNeg = mp.GetStatus() == lmtpb.LinkMargin_Lane_MarginPoint_S_MARGINING
 			}
-			if passNeg {
+			if passNeg && mpFailNeg == nil {
 				mpPassNeg = mp
 			} else if mpFailNeg == nil {
 				mpFailNeg = mp

@@ -25,6 +25,7 @@ import (
 	"math"
 	"os"
 	"slices"
+	"strings"
 
 	log "github.com/golang/glog"
 	"google.golang.org/protobuf/encoding/prototext"
@@ -76,6 +77,11 @@ func ConvertToCsv(csvfn string) {
 		eTlane      = iota
 		eVmargin    = iota
 		eVlane      = iota
+		eCorner     = iota
+		eLeft       = iota
+		eRight      = iota
+		eBottom     = iota
+		eTop        = iota
 		eSize       = iota
 	)
 	hdr := make([]string, eSize)
@@ -92,6 +98,11 @@ func ConvertToCsv(csvfn string) {
 	hdr[eTlane] = "Tlane"
 	hdr[eVmargin] = "Vmargin"
 	hdr[eVlane] = "Vlane"
+	hdr[eCorner] = "Corner"
+	hdr[eLeft] = "Left[UI]"
+	hdr[eRight] = "Right[UI]"
+	hdr[eBottom] = "Bottom[V]"
+	hdr[eTop] = "Top[V]"
 
 	w.Write(hdr)
 	w.Flush()
@@ -126,6 +137,11 @@ func ConvertToCsv(csvfn string) {
 		w.Write(rbdf)
 		w.Flush()
 		for _, ln := range lm.GetReceiverLanes() {
+			eye := make([]string, eSize)
+			eye[eBDF] = "\"" + lm.GetUspBdf() + "\"" // Prevents converting to dates.
+			eye[eReceiver] = ln.GetReceiver().String()
+			eye[eLane] = fmt.Sprintf("%d", ln.GetLaneNumber())
+
 			r := make([]string, eSize)
 			r[eReceiver] = ln.GetReceiver().String()
 			r[eLane] = fmt.Sprintf("%d", ln.GetLaneNumber())
@@ -177,7 +193,41 @@ func ConvertToCsv(csvfn string) {
 					r[eVmargin] = fmt.Sprintf("%f", margin)
 					r[eVlane] = fmt.Sprintf("%d", lane)
 				}
+
+				// wasd vs. hjkl: gamer=pass; vi=fail
+				r[eCorner] = ""
+				if strings.Contains(mp.GetInfo(), "MAX PASSING") {
+					eye[eCorner] = "eye corners"
+					switch mp.GetDirection() {
+					case lmtpb.LinkMargin_Lane_MarginPoint_D_LEFT:
+						r[eCorner] = "A"
+						eye[eLeft] = r[eTmargin]
+					case lmtpb.LinkMargin_Lane_MarginPoint_D_RIGHT:
+						r[eCorner] = "D"
+						eye[eRight] = r[eTmargin]
+					case lmtpb.LinkMargin_Lane_MarginPoint_D_UP:
+						r[eCorner] = "W"
+						eye[eTop] = r[eVmargin]
+					case lmtpb.LinkMargin_Lane_MarginPoint_D_DOWN:
+						r[eCorner] = "S"
+						eye[eBottom] = r[eVmargin]
+					}
+				} else if strings.Contains(mp.GetInfo(), "MIN FAILING") {
+					switch mp.GetDirection() {
+					case lmtpb.LinkMargin_Lane_MarginPoint_D_LEFT:
+						r[eCorner] = "H"
+					case lmtpb.LinkMargin_Lane_MarginPoint_D_RIGHT:
+						r[eCorner] = "L"
+					case lmtpb.LinkMargin_Lane_MarginPoint_D_UP:
+						r[eCorner] = "K"
+					case lmtpb.LinkMargin_Lane_MarginPoint_D_DOWN:
+						r[eCorner] = "J"
+					}
+				}
 				w.Write(r)
+			}
+			if eye[eCorner] != "" {
+				w.Write(eye)
 			}
 		}
 		w.Flush()

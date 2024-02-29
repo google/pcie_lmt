@@ -1,6 +1,6 @@
 # PCIe-LMT (PCIe Lane Margin Test)
 
-Hua Tang
+huat@google.com
 
 The LMT (Lane Margin Test) checks the signal quality of the PCIe link. The test
 utilizes the PCIe Lane Margining at Receiver (LMR) feature. The LMR is specified
@@ -55,7 +55,7 @@ bazel-bin/lmt_/lmt \
   -csv=dut_lmt_result.csv
 ```
 
-To plot the result in Google Sheets, make a copy of this [Google Sheet](https://docs.google.com/spreadsheets/d/1-do-2YzfelGlOP8fjFp2cVxNchu6K4X05dwvH-HCBaQ)
+To plot the result in Google Sheets, make a copy of this [Google Sheet](https://docs.google.com/spreadsheets/d/1-do-2YzfelGlOP8fjFp2cVxNchu6K4X05dwvH-HCBaQ0)
 Then import the dut_lmt_result.csv as a new sheet. Click the menu button `LMT
 Plot` -> `Create Gradient Charts` to plot the charts.
 
