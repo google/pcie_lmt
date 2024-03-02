@@ -15,6 +15,7 @@
 load("@bazel_gazelle//:def.bzl", "gazelle")
 load("@io_bazel_rules_go//go:def.bzl", "go_binary", "go_library")
 load("@io_bazel_rules_go//proto:def.bzl", "go_proto_library")
+load("@com_google_protobuf//:protobuf.bzl", "py_proto_library")
 
 # gazelle:prefix local/pcie_lmt
 gazelle(name = "gazelle")
@@ -28,6 +29,11 @@ go_proto_library(
     name = "lmt_go_proto",
     importpath = "lmt_go.proto",
     proto = ":lmt_proto",
+)
+
+py_proto_library(
+    name = "lmt_py_proto",
+    srcs = ["lmt.proto"],
 )
 
 go_library(
