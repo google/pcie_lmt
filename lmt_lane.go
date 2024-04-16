@@ -82,6 +82,13 @@ func (ln *Lane) Init(
 	ln.stepID = fmt.Sprintf("bus%02x-rec%s-ln%02d", cfg.GetBus()[0], ln.rec.String(), ln.laneNumber)
 }
 
+const (
+	// MaxTimingOffset is between 20 and 50; default to the max.
+	defaultMaxTimingOffset = 50
+  // MaxVoltageOffset is between 5 and 50; default to the max.
+	defaultMaxVoltageOffset = 50
+)
+
 // readLaneParameters() reads the Lane margining capability parameters from each
 // Lane.
 func (ln *Lane) readLaneParameters() error {
@@ -122,12 +129,20 @@ func (ln *Lane) readLaneParameters() error {
 		return err
 	}
 	param.MaxTimingOffset = uint32(rsp.payload & MskMaxTimingOffset)
+	// 0 may be reported if the vendor chooses not to report the offset. Then default to the max.
+	if param.MaxTimingOffset == 0 {
+		param.MaxTimingOffset = defaultMaxTimingOffset
+	}
 
 	cmd.payload = RptMaxVoltageOffset
 	if rsp, err = ln.lmrCmdRsp(&cmd); err != nil {
 		return err
 	}
 	param.MaxVoltageOffset = uint32(rsp.payload & MskMaxVoltageOffset)
+	// 0 may be reported if the vendor chooses not to report the offset. Then default to the max.
+	if param.MaxVoltageOffset == 0 {
+		param.MaxVoltageOffset = defaultMaxVoltageOffset
+	}
 
 	cmd.payload = RptSamplingRateVoltage
 	if rsp, err = ln.lmrCmdRsp(&cmd); err != nil {
