@@ -56,13 +56,15 @@ go_library(
     ],
 )
 
-# bazel build //:lmt 
-# TODO(anyone?): --platforms=@io_bazel_rules_go//go/toolchain:linux_arm_cgo gives error:
-#       Unable to find a CC toolchain
+# bazel build //:lmt \
+#   --platforms=@io_bazel_rules_go//go/toolchain:linux_arm64_cgo
 go_binary(
     name = "lmt",
     srcs = ["lmt.go"],
-    x_defs = {"main.version":"{VERSION}", "main.buildTime":"{BUILD_TIME}"},
+    x_defs = {
+        "main.version": "{VERSION}",
+        "main.buildTime": "{BUILD_TIME}",
+    },
     deps = [
         ":lanemargintest",
         "@com_github_golang_glog//:go_default_library",

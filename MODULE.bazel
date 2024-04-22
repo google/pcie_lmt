@@ -1,0 +1,20 @@
+###############################################################################
+# Bazel now uses Bzlmod by default to manage external dependencies.
+# Please consider migrating your external dependencies from WORKSPACE to MODULE.bazel.
+#
+# For more details, please check https://github.com/bazelbuild/bazel/issues/18958
+###############################################################################
+module(
+    name = "pcie_lmt",
+    version = "0.1.0",
+    compatibility_level = 1,
+)
+
+"""ARM cross compilation toolchains for bazel"""
+bazel_dep(name = "toolchains_arm_gnu", version = "1.0.0")
+
+arm_toolchain = use_extension("@toolchains_arm_gnu//:extensions.bzl", "arm_toolchain")
+
+arm_toolchain.aarch64_none_linux_gnu()
+use_repo(arm_toolchain, "aarch64_none_linux_gnu")
+register_toolchains("@aarch64_none_linux_gnu//toolchain:all")

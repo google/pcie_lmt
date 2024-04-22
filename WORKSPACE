@@ -34,7 +34,7 @@ load("@bazel_gazelle//:deps.bzl", "gazelle_dependencies", "go_repository")
 
 go_rules_dependencies()
 
-go_register_toolchains(version = "1.21.4")
+go_register_toolchains(version = "1.22.2")
 
 gazelle_dependencies()
 
@@ -64,14 +64,6 @@ http_archive(
         "https://mirror.bazel.build/github.com/bazelbuild/bazel-skylib/releases/download/1.5.0/bazel-skylib-1.5.0.tar.gz",
         "https://github.com/bazelbuild/bazel-skylib/releases/download/1.5.0/bazel-skylib-1.5.0.tar.gz",
     ],
-)
-
-http_archive(
-    name = "zlib",
-    build_file = "@//:zlib.BUILD",
-    sha256 = "ff0ba4c292013dbc27530b3a81e1f9a813cd39de01ca5e0f8bf355702efa593e",
-    strip_prefix = "zlib-1.3",
-    url = "https://zlib.net/zlib-1.3.tar.gz",
 )
 
 http_archive(
