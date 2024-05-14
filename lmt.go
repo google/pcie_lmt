@@ -17,6 +17,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -28,7 +29,9 @@ import (
 	
 	
 	log "github.com/golang/glog"
+	structpb "google.golang.org/protobuf/types/known/structpb"
 	pbj "google.golang.org/protobuf/encoding/protojson"
+	ocppb "ocpdiag/results_go_proto"
 	lmt "local/lanemargintest"
 )
 
@@ -52,9 +55,16 @@ func main() {
 		result   = flag.String("result", "result.pbtxt", "The result pbtxt file name.")
 		csv      = flag.String("csv", "", "Dumps a csv file for plotting.")
 		pb2csv   = flag.Bool("result2csv", false, "Converts the [result] to a [csv] file for plotting.")
+		ocpPipe  = flag.String("ocp_pipe", "/dev/null", "Named pipe or file to stream the OCP Artifacts.")
 	)
 	
 	flag.Parse()
+
+	lmt.TestRunStart = &ocppb.TestRunStart{
+		Name:        "pcie_lmt",
+		Version:     version,
+		CommandLine: fmt.Sprint(os.Args),
+	}
 
 	if *getVer {
 		fmt.Printf("Version:\t%s\n", version)
@@ -136,7 +146,23 @@ func main() {
 		log.Exit(err)
 	} else if err := os.WriteFile(fn, data, 0600); err != nil {
 		log.Exit(err)
+	} else {
+		var v structpb.Struct
+		if err := json.Unmarshal(data, &v); err != nil {
+			log.Exit(err)
+		}
+		lmt.TestRunStart.Parameters = &v
 	}
+
+	if f, err := os.OpenFile(*ocpPipe, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0777); err != nil {
+		log.Fatalf("error opening the ocp_pipe: %s %v", *ocpPipe, err)
+		lmt.OcpPipe = nil
+	} else {
+		lmt.OcpPipe = f
+	}
+
+	// Initialize the OCP output artifact's sequence number. Default is 0.
+	lmt.SeqNum.Store(int32(0)) // 0  because of the atomicity of the counter.Add(1)
 
 	// Runs lane margin test.
 	t := time.Now()

@@ -96,6 +96,9 @@ message LinkMargin {
     // For bring-up use case, margining can be tested only on a single lane.
     // However, the same lane_number must be specified on both tspec and vspec.
     repeated uint32 lane_number = 9;  // If specified, only test listed lanes.
+    // If the eye_size is specified, check the eye width (UI) or height (V), the
+    // difference between the max passing offsets in the opposit directions.
+    optional float eye_size = 10;
   }
 
   // Use a list of receiver_lanes to support retimers (preferred).
@@ -160,5 +163,7 @@ message LinkMargin {
     }
     optional bool pass = 10;
     optional string extra_info = 11;
+    optional float eye_width = 12;   // eye width in UI (<= 2 * target_offset).
+    optional float eye_height = 13;  // eye height in V (<= 2 * target_offset).
   }
 }

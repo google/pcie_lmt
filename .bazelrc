@@ -2,5 +2,4 @@
 common --enable_bzlmod
 
 build --stamp --workspace_status_command=$(pwd)/stamp.sh \
-  --registry="file://%workspace%/registry" --registry=https://bcr.bazel.build \
   --incompatible_enable_cc_toolchain_resolution

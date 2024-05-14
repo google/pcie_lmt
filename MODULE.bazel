@@ -11,7 +11,7 @@ module(
 )
 
 """ARM cross compilation toolchains for bazel"""
-bazel_dep(name = "toolchains_arm_gnu", version = "1.0.0")
+bazel_dep(name = "toolchains_arm_gnu", version = "1.0.1")
 
 arm_toolchain = use_extension("@toolchains_arm_gnu//:extensions.bzl", "arm_toolchain")
 

@@ -36,11 +36,14 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	log "github.com/golang/glog"
+	timestamppb "google.golang.org/protobuf/types/known/timestamppb"
 	pbj "google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/encoding/prototext"
 	"google.golang.org/protobuf/proto"
+	ocppb "ocpdiag/results_go_proto"
 	lmtpb "lmt_go.proto"
 	pci "pciutils"
 )
@@ -49,6 +52,19 @@ import (
 // Disclaimer: The terms here are not strictly following the PCIe terminology for legacy and
 //             implementation reasons.
 // /////////////////////////////////////////////////////////////////////////////////////////////////
+
+// OcpPipe points to the ocp artifact streaming pipe shared by all lm go routines.
+var OcpPipe *os.File
+var ocpPipeLock sync.Mutex
+
+// SeqNum is a shared monotonically increasing counter for determining if any artifact is lost.
+var SeqNum atomic.Int32
+
+// TestRunStart is the OCP starting message
+var TestRunStart *ocppb.TestRunStart
+
+// TestRunEnd tracks the OCP TestStatus and TestResult
+var TestRunEnd *ocppb.TestRunEnd
 
 // lts (LinkTests) is the overall storage object.
 var lts []*linktest
@@ -88,6 +104,7 @@ type receiver struct {
 	lanes     []*Lane
 	rxwg      *sync.WaitGroup // To sync the receiver port.
 	linkwg    *sync.WaitGroup // Sometimes, the receiver needs to wait for other links.
+	hwinfo    string          // OCP hardware_info_id
 }
 
 // /////////////////////////////////////////////////////////////////////////////////////////////////
@@ -176,6 +193,9 @@ func MarginLinks(cfg *lmtpb.LinkMargin) error {
 		return err
 	}
 
+	// Starts OCP TestRun
+	ocpTestRunStart()
+
 	// Tests all links in parallel. Waits for all links to finish testing.
 	var wg sync.WaitGroup
 	for _, lt := range lts {
@@ -189,7 +209,132 @@ func MarginLinks(cfg *lmtpb.LinkMargin) error {
 		}
 	}
 	wg.Wait()
+
+	// OCP TestRunEnd
+	TestRunEnd.Status = ocppb.TestRunEnd_COMPLETE
+	TestRunEnd.Result = ocppb.TestRunEnd_NOT_APPLICABLE
+	for _, lt := range lts {
+		if lt.testReady {
+			for _, l := range lt.pb.ReceiverLanes {
+				if l.Pass != nil {
+					if *l.Pass && TestRunEnd.Result != ocppb.TestRunEnd_FAIL {
+						TestRunEnd.Result = ocppb.TestRunEnd_PASS
+					} else {
+						TestRunEnd.Result = ocppb.TestRunEnd_FAIL
+					}
+				}
+			}
+		}
+	}
+	runArti := &ocppb.TestRunArtifact{
+		Artifact: &ocppb.TestRunArtifact_TestRunEnd{TestRunEnd},
+	}
+	artiOut := &ocppb.OutputArtifact{
+		Artifact: &ocppb.OutputArtifact_TestRunArtifact{runArti},
+	}
+	outputArtifact(artiOut)
+	OcpPipe.Close()
+
 	return nil
+}
+
+// outputArtifact() streams artiOut to the OcpPipe.
+func outputArtifact(artiOut *ocppb.OutputArtifact) {
+	artiOut.SequenceNumber = int32(SeqNum.Add(1))
+	artiOut.Timestamp = timestamppb.Now()
+	opt := &pbj.MarshalOptions{
+		UseProtoNames:   false,
+		UseEnumNumbers:  false,
+		EmitUnpopulated: false,
+		Multiline:       false,
+		Indent:          "",
+		AllowPartial:    false,
+	}
+	if data, err := opt.Marshal(artiOut); err != nil {
+		log.Errorf("pbj.Marshal(%v) failed: %v", data, err)
+	} else {
+		ocpPipeLock.Lock()
+		OcpPipe.Write(data)
+		OcpPipe.WriteString("\n")
+		ocpPipeLock.Unlock()
+	}
+}
+
+// ocpTestRunStart starts an OCP TestRun
+func ocpTestRunStart() {
+	ver := &ocppb.SchemaVersion{
+		Major: 2,
+		Minor: 0,
+	}
+	artiOut := &ocppb.OutputArtifact{
+		Artifact: &ocppb.OutputArtifact_SchemaVersion{ver},
+	}
+	outputArtifact(artiOut)
+
+	dutInfo := &ocppb.DutInfo{
+		DutInfoId:     "this_pcie",
+		Name:          "pcie_lmt_dut_info",
+		SoftwareInfos: []*ocppb.SoftwareInfo{},
+	}
+
+	var hwInfo *ocppb.HardwareInfo
+	for _, lt := range lts {
+		hwInfo = &ocppb.HardwareInfo{
+			HardwareInfoId: "BDF=" + lt.dsp.dev.BDFString() + ";RX=" + lmtpb.LinkMargin_ReceiverEnum(1).String()[2:],
+			Name:           "DSP",
+		}
+		dutInfo.HardwareInfos = append(dutInfo.HardwareInfos, hwInfo)
+
+		hwInfo = &ocppb.HardwareInfo{
+			HardwareInfoId: "BDF=" + lt.usp.dev.BDFString() + ";RX=" + lmtpb.LinkMargin_ReceiverEnum(6).String()[2:],
+			Name:           "USP",
+		}
+		dutInfo.HardwareInfos = append(dutInfo.HardwareInfos, hwInfo)
+
+		// Reads if retimer presents
+		addr := lt.dsp.pcieCapOffset + C.PCI_EXP_LNKSTA2
+		val := pci.ReadWord(lt.dsp.dev, addr)
+		retimer0 := (val & C.PCI_EXP_LINKSTA2_RETIMER) != 0
+		retimer1 := (val & C.PCI_EXP_LINKSTA2_2RETIMERS) != 0
+		if retimer0 {
+			hwInfo = &ocppb.HardwareInfo{
+				HardwareInfoId: "BDF=" + lt.dsp.dev.BDFString() + ";RX=" + lmtpb.LinkMargin_ReceiverEnum(2).String()[2:],
+				Name:           "Retimer0-USP",
+			}
+			dutInfo.HardwareInfos = append(dutInfo.HardwareInfos, hwInfo)
+			hwInfo = &ocppb.HardwareInfo{
+				HardwareInfoId: "BDF=" + lt.dsp.dev.BDFString() + ";RX=" + lmtpb.LinkMargin_ReceiverEnum(3).String()[2:],
+				Name:           "Retimer0-DSP",
+			}
+			dutInfo.HardwareInfos = append(dutInfo.HardwareInfos, hwInfo)
+		}
+		if retimer1 {
+			hwInfo = &ocppb.HardwareInfo{
+				HardwareInfoId: "BDF=" + lt.dsp.dev.BDFString() + ";RX=" + lmtpb.LinkMargin_ReceiverEnum(4).String()[2:],
+				Name:           "Retimer1-USP",
+			}
+			dutInfo.HardwareInfos = append(dutInfo.HardwareInfos, hwInfo)
+			hwInfo = &ocppb.HardwareInfo{
+				HardwareInfoId: "BDF=" + lt.dsp.dev.BDFString() + ";RX=" + lmtpb.LinkMargin_ReceiverEnum(5).String()[2:],
+				Name:           "Retimer1-DSP",
+			}
+			dutInfo.HardwareInfos = append(dutInfo.HardwareInfos, hwInfo)
+		}
+	}
+
+	TestRunStart.DutInfo = dutInfo
+	runArti := &ocppb.TestRunArtifact{
+		Artifact: &ocppb.TestRunArtifact_TestRunStart{TestRunStart},
+	}
+	artiOut = &ocppb.OutputArtifact{
+		Artifact: &ocppb.OutputArtifact_TestRunArtifact{runArti},
+	}
+	outputArtifact(artiOut)
+
+	TestRunEnd = &ocppb.TestRunEnd{
+		Status: ocppb.TestRunEnd_UNKNOWN,
+		Result: ocppb.TestRunEnd_NOT_APPLICABLE,
+	}
 }
 
 // /////////////////////////////////////////////////////////////////////////////////////////////////
@@ -289,6 +434,8 @@ func getLinks(devs *pci.Dev, cfg *lmtpb.LinkMargin) ([]*linktest, error) {
 
 				if p.lmrAddr, err = p.getLMRcapability(); err != nil {
 					p.testReady = false
+					// The LMR is required at gen4 and above. If it's not found, it's like not a real link.
+					lt.testReady = false
 					msg.WriteString(fmt.Sprintf("Error: %s: %s | ", bdf, err.Error()))
 				} else {
 					msg.WriteString(fmt.Sprintf("Info: %s: LMR CAP offset=%x | ", bdf, p.lmrAddr))

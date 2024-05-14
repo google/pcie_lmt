@@ -13,13 +13,14 @@
 # limitations under the License.
 
 load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
+load("@bazel_tools//tools/build_defs/repo:git.bzl", "git_repository")
 
 http_archive(
     name = "io_bazel_rules_go",
-    sha256 = "278b7ff5a826f3dc10f04feaf0b70d48b68748ccd512d7f98bf442077f043fe3",
+    sha256 = "f74c98d6df55217a36859c74b460e774abc0410a47cc100d822be34d5f990f16",
     urls = [
-        "https://mirror.bazel.build/github.com/bazelbuild/rules_go/releases/download/v0.41.0/rules_go-v0.41.0.zip",
-        "https://github.com/bazelbuild/rules_go/releases/download/v0.41.0/rules_go-v0.41.0.zip",
+        "https://mirror.bazel.build/github.com/bazelbuild/rules_go/releases/download/v0.47.1/rules_go-v0.47.1.zip",
+        "https://github.com/bazelbuild/rules_go/releases/download/v0.47.1/rules_go-v0.47.1.zip",
     ],
 )
 
@@ -37,6 +38,23 @@ go_rules_dependencies()
 go_register_toolchains(version = "1.22.2")
 
 gazelle_dependencies()
+
+git_repository(
+    name = "ocpdiag",
+    build_file = "@//:result_proto.BUILD",
+    commit = "7f38c4d",
+    remote = "https://github.com/opencomputeproject/ocp-diag-core-cpp",
+)
+
+# com_github_grpc_grpc is needed by ocpdiag
+http_archive(
+    name = "com_github_grpc_grpc",
+    patch_args = ["-p1"],
+    patches = ["@ocpdiag//external:grpc_patch.diff"],
+    sha256 = "feaeeb315133ea5e3b046c2c0231f5b86ef9d297e536a14b73e0393335f8b157",
+    strip_prefix = "grpc-1.51.3",
+    url = "https://github.com/grpc/grpc/archive/refs/tags/v1.51.3.tar.gz",
+)
 
 go_repository(
     name = "org_golang_x_xerrors",
