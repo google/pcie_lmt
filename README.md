@@ -1,13 +1,32 @@
 # PCIe-LMT (PCIe Lane Margin Test)
 
-huat@google.com
-
 The LMT (Lane Margin Test) checks the signal quality of the PCIe link. The test
 utilizes the PCIe Lane Margining at Receiver (LMR) feature. The LMR is specified
 in PCIe Base Spec 5.0 sections 4.2.13, 7.7.7 and 8.4.4. The LMR samples bits at each offset away from
 the eye center and checks against the expected value at the eye center. This
 test explores the error rate both timing-wise and voltage-wise. Here's a
 [PCIe LMT Overview presentation](https://docs.google.com/presentation/d/1a5xyykoV7n4HS6U9ag1mB2jeEvyaLT4BICTSh0fEqXA)
+
+## Features
+### PCI-SIG LMR spec support:
+- Supports both timing and voltage margining
+- Supports retimer receivers
+- Works with or without independent-error-sampler
+- Supports both sample count and sample rate reporting methods
+
+### Performance:
+- Lane-parallel-margining for speed when independent-error-sampler presents
+- Link-parallel-margining for speed
+- Golang tool engine; Protobuf test spec and result. 
+
+### Use cases and compatibility:
+- Target offset pass-fail testing, or
+- Eye scan with offset sweep: Start|Target|Step
+- Eye-size checking or Eye-corner offset checking
+- [OCP-Diag](https://github.com/opencomputeproject/ocp-diag-core/tree/main/json_spec) compliant artifact streaming
+- Supports both x86 and ARM
+- Linux-only: LMT uses the pciutils lib, which is behind the lspci and setpci tools.
+- Colorful plotting in Google Sheet
 
 A [lmt.proto](lmt.proto) specifies all aspects of the test, as well as logging the test result. The
 top-level proto message specifies the PCIe link(s) to test. Each receiver point
@@ -40,13 +59,15 @@ Version: 0.1 : demo
 
 ## Build and Run Commands:
 ```
-bazel build -c opt :lmt
+bazel build -c opt :lmt \
+  --platforms=@io_bazel_rules_go//go/toolchain:linux_arm64_cgo  # ARM support
 bazel run -c opt :lmt -- -h
 
 bazel run -c opt :lmt -- -alsologtostderr -v=0 \
   -spec=dut_lmt_spec.pbtxt \
   -result=dut_lmt_result.pbtxt \
   -csv=dut_lmt_result.csv \
+  -ocp_pipe=dut_lmt_ocp.json \
   -vendor_id=0x1000 -device_id=0xC030 \
   -bus=0x81,0xa1,0x63
 
@@ -58,17 +79,6 @@ bazel-bin/lmt_/lmt \
 To plot the result in Google Sheets, make a copy of this [Google Sheet](https://docs.google.com/spreadsheets/d/1-do-2YzfelGlOP8fjFp2cVxNchu6K4X05dwvH-HCBaQ0)
 Then import the dut_lmt_result.csv as a new sheet. Click the menu button `LMT
 Plot` -> `Create Gradient Charts` to plot the charts.
-
-## Feature Support
-- Supports both timing and voltage margining
-- Supports retimer receivers
-- Works with or without independent error sampler
-- Supports lane-parallel-margining when independent error sampler presents
-- Supports link-parallel-margining
-- Supports both sample count and sample rate reporting methods
-- Supports offset sweep: Start|Target|Step
-- Supports Linux only: LMT uses the pciutils lib, which is behind the lspci and setpci tools.
-- Implemented in Golang tool engine; Protobuf test spec and result; Stand-alone executable main() or other integration layer; Google Sheet colorful plotting.
 
 ## Test Spec and Result Examples
 Refer to [lmt.proto](lmt.proto).
@@ -86,6 +96,7 @@ test_specs: {
   step: 1
   # target_offset: 20
   # lane_number: 0
+  eye_size: 0.050
 }
 ```
 Test spec for pass-fail:

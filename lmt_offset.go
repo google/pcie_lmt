@@ -21,6 +21,8 @@ import (
 	"math"
 	"time"
 
+	structpb "google.golang.org/protobuf/types/known/structpb"
+	ocppb "ocpdiag/results_go_proto"
 	lmtpb "lmt_go.proto"
 	pci "pciutils"
 )
@@ -59,6 +61,7 @@ func (ln *Lane) margin(offset uint16, vNotT bool, sps float64) (
 	var dir lmtpb.LinkMargin_Lane_MarginPoint_DirectionEnum
 	var steps uint16
 	var dwell time.Duration
+	var ocpName string
 	if vNotT {
 		cmd.typ = MarginTypeVoltage
 		steps = offset &^ VoltageDirMask
@@ -69,11 +72,14 @@ func (ln *Lane) margin(offset uint16, vNotT bool, sps float64) (
 		if ln.param.GetIndUpDownVoltage() {
 			if (offset & VoltageDirMask) == 0 {
 				dir = lmtpb.LinkMargin_Lane_MarginPoint_D_UP
+				ocpName = fmt.Sprintf("V:+%fV", vv)
 			} else {
 				dir = lmtpb.LinkMargin_Lane_MarginPoint_D_DOWN
+				ocpName = fmt.Sprintf("V:-%fV", vv)
 			}
 		} else {
 			dir = lmtpb.LinkMargin_Lane_MarginPoint_D_UD
+			ocpName = fmt.Sprintf("V:%fV", vv)
 		}
 		dwell = time.Duration(ln.Vspec.GetDwell()) * time.Second
 	} else {
@@ -86,11 +92,14 @@ func (ln *Lane) margin(offset uint16, vNotT bool, sps float64) (
 		if ln.param.GetIndLeftRightTiming() {
 			if (offset & TimingDirMask) == 0 {
 				dir = lmtpb.LinkMargin_Lane_MarginPoint_D_RIGHT
+				ocpName = fmt.Sprintf("T:+%fUI", ui)
 			} else {
 				dir = lmtpb.LinkMargin_Lane_MarginPoint_D_LEFT
+				ocpName = fmt.Sprintf("T:-%fUI", ui)
 			}
 		} else {
 			dir = lmtpb.LinkMargin_Lane_MarginPoint_D_LR
+			ocpName = fmt.Sprintf("T:%fUI", ui)
 		}
 		dwell = time.Duration(ln.Tspec.GetDwell()) * time.Second
 	}
@@ -169,16 +178,18 @@ looping:
 			break looping
 		}
 	}
+	bitCount := float64(point.ErrorCount) // bitCount is used to calculate BER
 	if setSampleCount {
 		// gets sample count
 		if ln.param.GetSampleReportingMethod() || !ln.param.GetIndErrorSampler() {
 			// The samples are counted by rate * dwell.
 			// AMD CPU does not have error sampler. It also does not report a sample count.
-			bitCount := dwellActual.Seconds() * sps // Actual dwell * samples per second
+			bitCount = dwellActual.Seconds() * sps // Actual dwell * samples per second
 			// Refers to PCIe 5.0 spec 8.4.4: SampleCount = 3*log 2 (number of bits)
 			if bitCount == 0 {
 				samples := uint32(18) // 64 bits is for practical reason to differ from the default 0.
 				point.SampleCount = &samples
+				bitCount = math.Pow(2.0, float64(samples)/3.0)
 			} else {
 				samples := uint32(math.Round(math.Log2(bitCount) * 3))
 				point.SampleCount = &samples
@@ -190,6 +201,7 @@ looping:
 				return point, err
 			}
 			samples := uint32(rsp.payload & MskSampleCount)
+			bitCount = math.Pow(2.0, float64(samples)/3.0)
 			point.SampleCount = &samples
 		}
 	}
@@ -197,6 +209,62 @@ looping:
 		"Point margin: Bus:%02x Rx:%-9s Ln:%2d  Dir:%-8s Step:%3d  Status:%-13s ErrCnt:%2d  Samples:%3d\n",
 		ln.cfg.GetBus()[0], ln.rec.String(), ln.laneNumber, point.GetDirection().String(),
 		point.GetSteps(), point.GetStatus().String(), point.GetErrorCount(), point.GetSampleCount())
+
+	if point.GetStatus() != lmtpb.LinkMargin_Lane_MarginPoint_S_MARGINING {
+		if point.GetStatus() == lmtpb.LinkMargin_Lane_MarginPoint_S_ERROR_OUT {
+			if !ln.eyeScanMode && !ln.eyeSizeCheck {
+				ln.Pass = false
+			}
+		} else {
+			ln.Pass = false
+		}
+	}
+
+	// Stream OCP TestStepMeasurement artifact
+	var unit string
+	if vNotT {
+		unit = fmt.Sprintf("Unit=V;Step=%03d;Dir=%-8s;Offset=%6.4f",
+			point.GetSteps(), point.GetDirection().String()[2:], point.GetVoltage())
+	} else {
+		unit = fmt.Sprintf("Unit=UI;Step=%03d;Dir=%-8s;Offset=%5.3f",
+			point.GetSteps(), point.GetDirection().String()[2:], point.GetPercentUi())
+	}
+	subcomp := &ocppb.Subcomponent{
+		Type: ocppb.Subcomponent_BUS,
+		Name: "PCIELMT-MARGINPOINT-PCI",
+		Location: fmt.Sprintf("BUS=%02xh;RX=%1d;LN=%02d;Offset=%s",
+			ln.cfg.GetBus()[0], ln.rec.Number(), ln.laneNumber, ocpName),
+	}
+
+	if !ln.eyeScanMode || point.GetStatus() != lmtpb.LinkMargin_Lane_MarginPoint_S_MARGINING {
+		m := &ocppb.Measurement{
+			Name:           fmt.Sprintf("LN=%02d;Step-Status", ln.laneNumber),
+			Value:          structpb.NewStringValue(point.GetStatus().String()[2:]),
+			Unit:           unit,
+			HardwareInfoId: ln.rx.hwinfo,
+			Subcomponent:   subcomp,
+			Validators:     []*ocppb.Validator{ln.statusVal},
+		}
+		ln.mStepArti.Artifact = &ocppb.TestStepArtifact_Measurement{Measurement: m}
+		outputArtifact(ln.stepArtiOut)
+	}
+
+	if (point.GetStatus() == lmtpb.LinkMargin_Lane_MarginPoint_S_MARGINING ||
+		point.GetStatus() == lmtpb.LinkMargin_Lane_MarginPoint_S_ERROR_OUT) && (!ln.eyeScanMode ||
+		point.ErrorCount != 0) {
+		m := &ocppb.Measurement{
+			Name:           fmt.Sprintf("LN=%02d;Step-BER", ln.laneNumber),
+			Value:          structpb.NewNumberValue(float64(point.ErrorCount) / bitCount),
+			Unit:           unit,
+			HardwareInfoId: ln.rx.hwinfo,
+			Subcomponent:   subcomp,
+		}
+		if !ln.eyeScanMode && !ln.eyeSizeCheck {
+			m.Validators = []*ocppb.Validator{ln.berVal}
+		}
+		ln.mStepArti.Artifact = &ocppb.TestStepArtifact_Measurement{Measurement: m}
+		outputArtifact(ln.stepArtiOut)
+	}
 
 	// Issues "Clear Error Log" and "Go to Normal Settings" commands
 	cmd.typ = MarginTypeSet

@@ -25,11 +25,13 @@ import (
 )
 
 import (
+	"fmt"
 	"slices"
 	"sync"
 
 	log "github.com/golang/glog"
 	"google.golang.org/protobuf/proto"
+	ocppb "ocpdiag/results_go_proto"
 	lmtpb "lmt_go.proto"
 	pci "pciutils"
 )
@@ -84,13 +86,14 @@ func (lt *linktest) marginLink() {
 		} else {
 			rxpt.port = lt.dsp
 		}
+		rxpt.hwinfo = "BDF=" + rxpt.port.dev.BDFString() + ";RX=" + rxpt.rec.String()[2:]
 		rxpt.linkwg = lt.wg
 		rxpt.rxwg = new(sync.WaitGroup)
 		rxpt.lanes = make([]*Lane, rxpt.port.width, rxpt.port.width)
 		for i := range rxpt.lanes {
 			rxpt.lanes[i] = new(Lane)
 			rxpt.lanes[i].Init(lt.pb, rxpt.port.dev, i, rxpt.port.lmrAddr,
-				rxpt.rec, rxpt.port.speed, rxpt.rxwg, rxpt.linkwg)
+				rxpt.rec, rxpt.port.speed, rxpt.rxwg, rxpt.linkwg, rxpt)
 		}
 		// Run lanes in parallel if the receiver lane has independent error sampler.
 		if rxpt.parallel, err = rxpt.lanes[0].GetIndErrorSampler(); err != nil {
@@ -134,6 +137,8 @@ func (lt *linktest) marginLink() {
 		}
 	}
 
+	const numLanes = 16 // estimated array-initial-size of lanes per port.
+	lanes := make([]*lmtpb.LinkMargin_Lane, 0, maxRxPerLink*numLanes)
 	// Tests upstream lanes in parallel, followed by downstream lanes in parallel,
 	// with wait in between to avoid pcilib sysfs error
 	var wg sync.WaitGroup
@@ -145,6 +150,20 @@ func (lt *linktest) marginLink() {
 			continue
 		} // Skips receivers not tested
 		log.V(1).Infoln("Margining lanes at receiver: ", r.rec.String())
+
+		// OCP TestStepStart
+		stepStart := &ocppb.TestStepStart{
+			Name: "LMT@" + r.hwinfo,
+		}
+		stepArti := &ocppb.TestStepArtifact{
+			Artifact:   &ocppb.TestStepArtifact_TestStepStart{stepStart},
+			TestStepId: r.hwinfo,
+		}
+		outArti := &ocppb.OutputArtifact{
+			Artifact: &ocppb.OutputArtifact_TestStepArtifact{stepArti},
+		}
+		outputArtifact(outArti)
+
 		for _, ln := range r.lanes {
 			if ln.Vspec == nil && ln.Tspec == nil {
 				continue
@@ -162,26 +181,62 @@ func (lt *linktest) marginLink() {
 			}(ln)
 		}
 		wg.Wait()
-	}
 
-	// Gather result protobuf
-	const numLanes = 16 // estimated array-initial-size of lanes per port.
-	lanes := make([]*lmtpb.LinkMargin_Lane, 0, maxRxPerLink*numLanes)
-	for _, r := range lt.allRx {
-		if r == nil {
-			continue
-		} // Skips R_BROADCAST0 = 0 and R_RESERVED = 7
-		if !r.testReady {
-			continue
-		} // Skips receivers not tested
+		// Gather result protobuf
+		lncnt := 0
+		failcnt := 0
 		for _, ln := range r.lanes {
 			if ln.Vspec != nil || ln.Tspec != nil {
 				if lanepb := ln.GatherResult(); lanepb != nil {
 					lanes = append(lanes, lanepb)
 				}
 			}
+			lncnt++
+			if !ln.Pass {
+				failcnt++
+			}
 		}
+
+		diag := &ocppb.Diagnosis{
+			Type:           ocppb.Diagnosis_UNKNOWN,
+			HardwareInfoId: r.hwinfo,
+		}
+		if lncnt == 0 {
+			diag.Verdict = "pcie_lmt-rx_ln-unknown"
+			diag.Message = "0 Rx-lane tested."
+		} else if failcnt == 0 {
+			diag.Type = ocppb.Diagnosis_PASS
+			diag.Verdict = "pcie_lmt-rx_ln-pass"
+			diag.Message = fmt.Sprintf("%d Rx-lane tested. All passed.", lncnt)
+		} else {
+			diag.Type = ocppb.Diagnosis_FAIL
+			diag.Verdict = "pcie_lmt-rx_ln-fail"
+			diag.Message = fmt.Sprintf("%d Rx-lane tested; %d failed.", lncnt, failcnt)
+		}
+
+		stepArti = &ocppb.TestStepArtifact{
+			Artifact:   &ocppb.TestStepArtifact_Diagnosis{diag},
+			TestStepId: r.hwinfo,
+		}
+		outArti = &ocppb.OutputArtifact{
+			Artifact: &ocppb.OutputArtifact_TestStepArtifact{stepArti},
+		}
+		outputArtifact(outArti)
+
+		// OCP TestStepEnd
+		stepEnd := &ocppb.TestStepEnd{
+			Status: ocppb.TestRunEnd_COMPLETE,
+		}
+		stepArti = &ocppb.TestStepArtifact{
+			Artifact:   &ocppb.TestStepArtifact_TestStepEnd{stepEnd},
+			TestStepId: r.hwinfo,
+		}
+		outArti = &ocppb.OutputArtifact{
+			Artifact: &ocppb.OutputArtifact_TestStepArtifact{stepArti},
+		}
+		outputArtifact(outArti)
 	}
+
 	lt.pb.ReceiverLanes = lanes
 }
 
@@ -190,33 +245,21 @@ func (ln *Lane) GatherResult() *lmtpb.LinkMargin_Lane {
 	if ln.lane == nil {
 		return nil
 	}
-	pass := true
 	ln.lane.LaneNumber = ln.laneNumber
 	ln.lane.Receiver = ln.rec
 	if ln.Tspec != nil {
 		ln.lane.Tspec = ln.Tspec
 		ln.lane.TimingMargins = ln.tsteps
-		for _, pt := range ln.tsteps {
-			if pt.Error != nil ||
-				pt.GetStatus() != lmtpb.LinkMargin_Lane_MarginPoint_S_MARGINING {
-				pass = false
-			}
-		}
+		ln.lane.EyeWidth = &ln.eyeWidth
 	}
 	if ln.Vspec != nil {
 		ln.lane.Vspec = ln.Vspec
 		ln.lane.VoltageMargins = ln.vsteps
-		for _, pt := range ln.vsteps {
-			if pt.Error != nil ||
-				pt.GetStatus() != lmtpb.LinkMargin_Lane_MarginPoint_S_MARGINING {
-				pass = false
-			}
-		}
+		ln.lane.EyeHeight = &ln.eyeHeight
 	}
 	ln.lane.LaneParameter = ln.param
 	ln.lane.ExtraInfo = &ln.msg
-	ln.lane.Pass = &pass
-	ln.Pass = pass
+	ln.lane.Pass = &ln.Pass
 	return ln.lane
 }
 
