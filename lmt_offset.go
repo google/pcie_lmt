@@ -19,6 +19,7 @@ package lanemargintest
 import (
 	"fmt"
 	"math"
+	"strings"
 	"time"
 
 	structpb "google.golang.org/protobuf/types/known/structpb"
@@ -224,10 +225,10 @@ looping:
 	var unit string
 	if vNotT {
 		unit = fmt.Sprintf("Unit=V;Step=%03d;Dir=%-8s;Offset=%6.4f",
-			point.GetSteps(), point.GetDirection().String()[2:], point.GetVoltage())
+			point.GetSteps(), strings.TrimPrefix(point.GetDirection().String(), "D_"), point.GetVoltage())
 	} else {
 		unit = fmt.Sprintf("Unit=UI;Step=%03d;Dir=%-8s;Offset=%5.3f",
-			point.GetSteps(), point.GetDirection().String()[2:], point.GetPercentUi())
+			point.GetSteps(), strings.TrimPrefix(point.GetDirection().String(), "D_"), point.GetPercentUi())
 	}
 	subcomp := &ocppb.Subcomponent{
 		Type: ocppb.Subcomponent_BUS,
@@ -239,7 +240,7 @@ looping:
 	if !ln.eyeScanMode || point.GetStatus() != lmtpb.LinkMargin_Lane_MarginPoint_S_MARGINING {
 		m := &ocppb.Measurement{
 			Name:           fmt.Sprintf("LN=%02d;Step-Status", ln.laneNumber),
-			Value:          structpb.NewStringValue(point.GetStatus().String()[2:]),
+			Value:          structpb.NewStringValue(strings.TrimPrefix(point.GetStatus().String(), "S_")),
 			Unit:           unit,
 			HardwareInfoId: ln.rx.hwinfo,
 			Subcomponent:   subcomp,

@@ -27,6 +27,7 @@ import (
 import (
 	"fmt"
 	"slices"
+	"strings"
 	"sync"
 
 	log "github.com/golang/glog"
@@ -86,7 +87,7 @@ func (lt *linktest) marginLink() {
 		} else {
 			rxpt.port = lt.dsp
 		}
-		rxpt.hwinfo = "BDF=" + rxpt.port.dev.BDFString() + ";RX=" + rxpt.rec.String()[2:]
+		rxpt.hwinfo = "BDF=" + rxpt.port.dev.BDFString() + ";RX=" + strings.TrimPrefix(rxpt.rec.String(), "R_")
 		rxpt.linkwg = lt.wg
 		rxpt.rxwg = new(sync.WaitGroup)
 		rxpt.lanes = make([]*Lane, rxpt.port.width, rxpt.port.width)

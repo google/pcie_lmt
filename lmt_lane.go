@@ -197,6 +197,7 @@ func (ln *Lane) readLaneParameters() error {
 		log.Errorf("pbj.Marshal(%v) failed: %v", data, err)
 		return err
 	}
+
 	m := &ocppb.Measurement{
 		Name:           fmt.Sprintf("LN=%02d;Lane-Parameters", ln.laneNumber),
 		Value:          structpb.NewStringValue(string(data)),
@@ -376,12 +377,12 @@ func (ln *Lane) MarginLane() error {
 		}
 		if ln.eyeScanMode || ln.eyeSizeCheck {
 			lv, _ := structpb.NewList([]any{
-				lmtpb.LinkMargin_Lane_MarginPoint_S_MARGINING.String()[2:],
-				lmtpb.LinkMargin_Lane_MarginPoint_S_ERROR_OUT.String()[2:]})
+				strings.TrimPrefix(lmtpb.LinkMargin_Lane_MarginPoint_S_MARGINING.String(), "S_"),
+				strings.TrimPrefix(lmtpb.LinkMargin_Lane_MarginPoint_S_ERROR_OUT.String(), "S_")})
 			ln.statusVal.Value = structpb.NewListValue(lv)
 		} else {
 			lv, _ := structpb.NewList([]any{
-				lmtpb.LinkMargin_Lane_MarginPoint_S_MARGINING.String()[2:]})
+				strings.TrimPrefix(lmtpb.LinkMargin_Lane_MarginPoint_S_MARGINING.String(), "S_")})
 			ln.statusVal.Value = structpb.NewListValue(lv)
 		}
 

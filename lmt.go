@@ -17,7 +17,6 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -29,9 +28,7 @@ import (
 	
 	
 	log "github.com/golang/glog"
-	structpb "google.golang.org/protobuf/types/known/structpb"
-	pbj "google.golang.org/protobuf/encoding/protojson"
-	ocppb "ocpdiag/results_go_proto"
+	"google.golang.org/protobuf/encoding/protojson"
 	lmt "local/lanemargintest"
 )
 
@@ -42,29 +39,22 @@ var (
 	// The init value here is stamped by the coder. The binary builder is expected to overwrite them.
 	version   = "2024-02-04"
 	buildTime = "unknown"
+
+	getVer   = flag.Bool("version", false, "Return the version number.")
+	vid      = flag.Int("vendor_id", -1, "The 16-bit Vendor ID of the USP (such as the EP).")
+	did      = flag.Int("device_id", -1, "The 16-bit Device ID of the USP (such as the EP).")
+	bus      = flag.String("bus", "", "A comma-separted list of bus numbers.")
+	spec     = flag.String("spec", "", "The test spec .pbtxt file.")
+	specJSON = flag.String("spec_json", "", "The test spec .json file.")
+	result   = flag.String("result", "result.pbtxt", "The result pbtxt file name.")
+	csv      = flag.String("csv", "", "Dumps a csv file for plotting.")
+	pb2csv   = flag.Bool("result2csv", false, "Converts the [result] to a [csv] file for plotting.")
+	ocpPipe  = flag.String("ocp_pipe", "/dev/null", "Named pipe or file to stream the OCP Artifacts.")
 )
 
 func main() {
-	var (
-		getVer   = flag.Bool("version", false, "Return the version number.")
-		vid      = flag.Int("vendor_id", -1, "The 16-bit Vendor ID of the USP (such as the EP).")
-		did      = flag.Int("device_id", -1, "The 16-bit Device ID of the USP (such as the EP).")
-		bus      = flag.String("bus", "", "A comma-separted list of bus numbers.")
-		spec     = flag.String("spec", "", "The test spec .pbtxt file.")
-		specJSON = flag.String("spec_json", "", "The test spec .json file.")
-		result   = flag.String("result", "result.pbtxt", "The result pbtxt file name.")
-		csv      = flag.String("csv", "", "Dumps a csv file for plotting.")
-		pb2csv   = flag.Bool("result2csv", false, "Converts the [result] to a [csv] file for plotting.")
-		ocpPipe  = flag.String("ocp_pipe", "/dev/null", "Named pipe or file to stream the OCP Artifacts.")
-	)
 	
 	flag.Parse()
-
-	lmt.TestRunStart = &ocppb.TestRunStart{
-		Name:        "pcie_lmt",
-		Version:     version,
-		CommandLine: fmt.Sprint(os.Args),
-	}
 
 	if *getVer {
 		fmt.Printf("Version:\t%s\n", version)
@@ -133,7 +123,7 @@ func main() {
 	}
 
 	// Automatically dump the test spec to a spec.dump.json.
-	opt := pbj.MarshalOptions{
+	opt := protojson.MarshalOptions{
 		UseProtoNames:   true,
 		UseEnumNumbers:  false,
 		EmitUnpopulated: false,
@@ -146,23 +136,15 @@ func main() {
 		log.Exit(err)
 	} else if err := os.WriteFile(fn, data, 0600); err != nil {
 		log.Exit(err)
-	} else {
-		var v structpb.Struct
-		if err := json.Unmarshal(data, &v); err != nil {
-			log.Exit(err)
-		}
-		lmt.TestRunStart.Parameters = &v
 	}
 
+	// If the file exists, it's assumed to be a named pipe to append in. Otherwise, it's a file to
+	// create and dump into.
 	if f, err := os.OpenFile(*ocpPipe, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0777); err != nil {
 		log.Fatalf("error opening the ocp_pipe: %s %v", *ocpPipe, err)
-		lmt.OcpPipe = nil
 	} else {
-		lmt.OcpPipe = f
+		lmt.OcpInit(f, "pcie_lmt", version, fmt.Sprint(os.Args), cfg)
 	}
-
-	// Initialize the OCP output artifact's sequence number. Default is 0.
-	lmt.SeqNum.Store(int32(0)) // 0  because of the atomicity of the counter.Add(1)
 
 	// Runs lane margin test.
 	t := time.Now()

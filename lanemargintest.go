@@ -30,6 +30,7 @@ import (
 )
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"slices"
@@ -39,8 +40,9 @@ import (
 	"sync/atomic"
 
 	log "github.com/golang/glog"
+	structpb "google.golang.org/protobuf/types/known/structpb"
 	timestamppb "google.golang.org/protobuf/types/known/timestamppb"
-	pbj "google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/encoding/prototext"
 	"google.golang.org/protobuf/proto"
 	ocppb "ocpdiag/results_go_proto"
@@ -52,19 +54,6 @@ import (
 // Disclaimer: The terms here are not strictly following the PCIe terminology for legacy and
 //             implementation reasons.
 // /////////////////////////////////////////////////////////////////////////////////////////////////
-
-// OcpPipe points to the ocp artifact streaming pipe shared by all lm go routines.
-var OcpPipe *os.File
-var ocpPipeLock sync.Mutex
-
-// SeqNum is a shared monotonically increasing counter for determining if any artifact is lost.
-var SeqNum atomic.Int32
-
-// TestRunStart is the OCP starting message
-var TestRunStart *ocppb.TestRunStart
-
-// TestRunEnd tracks the OCP TestStatus and TestResult
-var TestRunEnd *ocppb.TestRunEnd
 
 // lts (LinkTests) is the overall storage object.
 var lts []*linktest
@@ -107,6 +96,48 @@ type receiver struct {
 	hwinfo    string          // OCP hardware_info_id
 }
 
+var (
+	// ocpPipe points to the ocp artifact streaming pipe shared by all lm go routines.
+	ocpPipe     *os.File
+	ocpPipeLock sync.Mutex
+	// seqNum is a shared monotonically increasing counter for determining if any artifact is lost.
+	seqNum atomic.Int32
+	// testRunStart is the OCP starting message
+	testRunStart *ocppb.TestRunStart
+	// testRunEnd tracks the OCP TestStatus and TestResult
+	testRunEnd *ocppb.TestRunEnd
+)
+
+// OcpInit initializes the OCP output headers.
+func OcpInit(f *os.File, name string, version string, cmdline string, cfg *lmtpb.LinkMargin) {
+	ocpPipe = f
+	testRunStart = &ocppb.TestRunStart{
+		Name:        name,
+		Version:     version,
+		CommandLine: cmdline,
+	}
+	// Initialize the OCP output artifact's sequence number. Default is 0.
+	seqNum.Store(int32(0)) // 0  because of the atomicity of the counter.Add(1)
+
+	opt := protojson.MarshalOptions{
+		UseProtoNames:   true,
+		UseEnumNumbers:  false,
+		EmitUnpopulated: false,
+		Multiline:       true,
+		Indent:          "  ",
+		AllowPartial:    false,
+	}
+	if data, err := opt.Marshal(cfg); err != nil {
+		log.Exit(err)
+	} else {
+		var v structpb.Struct
+		if err := json.Unmarshal(data, &v); err != nil {
+			log.Exit(err)
+		}
+		testRunStart.Parameters = &v
+	}
+}
+
 // /////////////////////////////////////////////////////////////////////////////////////////////////
 
 // ReadLinkMargin reads in the test spec (cfg) from a linkmargin pbtxt or JSON.
@@ -123,7 +154,7 @@ func ReadLinkMargin(fn string, isJSON bool) (*lmtpb.LinkMargin, error) {
 	// Allocate a new PciConfigField to hold the deserialized proto.
 	cfg := &lmtpb.LinkMargin{}
 	if isJSON {
-		opt := pbj.UnmarshalOptions{
+		opt := protojson.UnmarshalOptions{
 			AllowPartial:   false,
 			DiscardUnknown: true,
 		}
@@ -194,7 +225,7 @@ func MarginLinks(cfg *lmtpb.LinkMargin) error {
 	}
 
 	// Starts OCP TestRun
-	ocpTestRunStart()
+	ocpTestRunStart(cfg)
 
 	// Tests all links in parallel. Waits for all links to finish testing.
 	var wg sync.WaitGroup
@@ -211,38 +242,40 @@ func MarginLinks(cfg *lmtpb.LinkMargin) error {
 	wg.Wait()
 
 	// OCP TestRunEnd
-	TestRunEnd.Status = ocppb.TestRunEnd_COMPLETE
-	TestRunEnd.Result = ocppb.TestRunEnd_NOT_APPLICABLE
+	testRunEnd.Status = ocppb.TestRunEnd_COMPLETE
+	testRunEnd.Result = ocppb.TestRunEnd_NOT_APPLICABLE
 	for _, lt := range lts {
 		if lt.testReady {
 			for _, l := range lt.pb.ReceiverLanes {
 				if l.Pass != nil {
-					if *l.Pass && TestRunEnd.Result != ocppb.TestRunEnd_FAIL {
-						TestRunEnd.Result = ocppb.TestRunEnd_PASS
+					if *l.Pass && testRunEnd.Result != ocppb.TestRunEnd_FAIL {
+						testRunEnd.Result = ocppb.TestRunEnd_PASS
 					} else {
-						TestRunEnd.Result = ocppb.TestRunEnd_FAIL
+						testRunEnd.Result = ocppb.TestRunEnd_FAIL
 					}
 				}
 			}
 		}
 	}
 	runArti := &ocppb.TestRunArtifact{
-		Artifact: &ocppb.TestRunArtifact_TestRunEnd{TestRunEnd},
+		Artifact: &ocppb.TestRunArtifact_TestRunEnd{testRunEnd},
 	}
 	artiOut := &ocppb.OutputArtifact{
 		Artifact: &ocppb.OutputArtifact_TestRunArtifact{runArti},
 	}
 	outputArtifact(artiOut)
-	OcpPipe.Close()
+	ocpPipeLock.Lock()
+	ocpPipe.Close()
+	ocpPipeLock.Unlock()
 
 	return nil
 }
 
 // outputArtifact() streams artiOut to the OcpPipe.
 func outputArtifact(artiOut *ocppb.OutputArtifact) {
-	artiOut.SequenceNumber = int32(SeqNum.Add(1))
+	artiOut.SequenceNumber = int32(seqNum.Add(1))
 	artiOut.Timestamp = timestamppb.Now()
-	opt := &pbj.MarshalOptions{
+	opt := &protojson.MarshalOptions{
 		UseProtoNames:   false,
 		UseEnumNumbers:  false,
 		EmitUnpopulated: false,
@@ -254,14 +287,22 @@ func outputArtifact(artiOut *ocppb.OutputArtifact) {
 		log.Errorf("pbj.Marshal(%v) failed: %v", data, err)
 	} else {
 		ocpPipeLock.Lock()
-		OcpPipe.Write(data)
-		OcpPipe.WriteString("\n")
+		ocpPipe.Write(data)
+		ocpPipe.WriteString("\n")
 		ocpPipeLock.Unlock()
 	}
 }
 
 // ocpTestRunStart starts an OCP TestRun
-func ocpTestRunStart() {
+func ocpTestRunStart(cfg *lmtpb.LinkMargin) {
+	if testRunStart == nil {
+		if f, err := os.OpenFile("/dev/null", os.O_RDWR|os.O_CREATE|os.O_APPEND, 0777); err != nil {
+			log.Fatalf("error opening /dev/null : %v", err)
+		} else {
+			OcpInit(f, "pcie_lmt", "undefined", fmt.Sprint(os.Args), cfg)
+		}
+	}
+
 	ver := &ocppb.SchemaVersion{
 		Major: 2,
 		Minor: 0,
@@ -280,13 +321,13 @@ func ocpTestRunStart() {
 	var hwInfo *ocppb.HardwareInfo
 	for _, lt := range lts {
 		hwInfo = &ocppb.HardwareInfo{
-			HardwareInfoId: "BDF=" + lt.dsp.dev.BDFString() + ";RX=" + lmtpb.LinkMargin_ReceiverEnum(1).String()[2:],
+			HardwareInfoId: "BDF=" + lt.dsp.dev.BDFString() + ";RX=" + strings.TrimPrefix(lmtpb.LinkMargin_ReceiverEnum(1).String(), "R_"),
 			Name:           "DSP",
 		}
 		dutInfo.HardwareInfos = append(dutInfo.HardwareInfos, hwInfo)
 
 		hwInfo = &ocppb.HardwareInfo{
-			HardwareInfoId: "BDF=" + lt.usp.dev.BDFString() + ";RX=" + lmtpb.LinkMargin_ReceiverEnum(6).String()[2:],
+			HardwareInfoId: "BDF=" + lt.usp.dev.BDFString() + ";RX=" + strings.TrimPrefix(lmtpb.LinkMargin_ReceiverEnum(6).String(), "R_"),
 			Name:           "USP",
 		}
 		dutInfo.HardwareInfos = append(dutInfo.HardwareInfos, hwInfo)
@@ -298,40 +339,40 @@ func ocpTestRunStart() {
 		retimer1 := (val & C.PCI_EXP_LINKSTA2_2RETIMERS) != 0
 		if retimer0 {
 			hwInfo = &ocppb.HardwareInfo{
-				HardwareInfoId: "BDF=" + lt.dsp.dev.BDFString() + ";RX=" + lmtpb.LinkMargin_ReceiverEnum(2).String()[2:],
+				HardwareInfoId: "BDF=" + lt.dsp.dev.BDFString() + ";RX=" + strings.TrimPrefix(lmtpb.LinkMargin_ReceiverEnum(2).String(), "R_"),
 				Name:           "Retimer0-USP",
 			}
 			dutInfo.HardwareInfos = append(dutInfo.HardwareInfos, hwInfo)
 			hwInfo = &ocppb.HardwareInfo{
-				HardwareInfoId: "BDF=" + lt.dsp.dev.BDFString() + ";RX=" + lmtpb.LinkMargin_ReceiverEnum(3).String()[2:],
+				HardwareInfoId: "BDF=" + lt.dsp.dev.BDFString() + ";RX=" + strings.TrimPrefix(lmtpb.LinkMargin_ReceiverEnum(3).String(), "R_"),
 				Name:           "Retimer0-DSP",
 			}
 			dutInfo.HardwareInfos = append(dutInfo.HardwareInfos, hwInfo)
 		}
 		if retimer1 {
 			hwInfo = &ocppb.HardwareInfo{
-				HardwareInfoId: "BDF=" + lt.dsp.dev.BDFString() + ";RX=" + lmtpb.LinkMargin_ReceiverEnum(4).String()[2:],
+				HardwareInfoId: "BDF=" + lt.dsp.dev.BDFString() + ";RX=" + strings.TrimPrefix(lmtpb.LinkMargin_ReceiverEnum(4).String(), "R_"),
 				Name:           "Retimer1-USP",
 			}
 			dutInfo.HardwareInfos = append(dutInfo.HardwareInfos, hwInfo)
 			hwInfo = &ocppb.HardwareInfo{
-				HardwareInfoId: "BDF=" + lt.dsp.dev.BDFString() + ";RX=" + lmtpb.LinkMargin_ReceiverEnum(5).String()[2:],
+				HardwareInfoId: "BDF=" + lt.dsp.dev.BDFString() + ";RX=" + strings.TrimPrefix(lmtpb.LinkMargin_ReceiverEnum(5).String(), "R_"),
 				Name:           "Retimer1-DSP",
 			}
 			dutInfo.HardwareInfos = append(dutInfo.HardwareInfos, hwInfo)
 		}
 	}
 
-	TestRunStart.DutInfo = dutInfo
+	testRunStart.DutInfo = dutInfo
 	runArti := &ocppb.TestRunArtifact{
-		Artifact: &ocppb.TestRunArtifact_TestRunStart{TestRunStart},
+		Artifact: &ocppb.TestRunArtifact_TestRunStart{testRunStart},
 	}
 	artiOut = &ocppb.OutputArtifact{
 		Artifact: &ocppb.OutputArtifact_TestRunArtifact{runArti},
 	}
 	outputArtifact(artiOut)
 
-	TestRunEnd = &ocppb.TestRunEnd{
+	testRunEnd = &ocppb.TestRunEnd{
 		Status: ocppb.TestRunEnd_UNKNOWN,
 		Result: ocppb.TestRunEnd_NOT_APPLICABLE,
 	}
