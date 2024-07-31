@@ -397,7 +397,7 @@ func getLinks(devs *pci.Dev, cfg *lmtpb.LinkMargin) ([]*linktest, error) {
 		vidChk := cfg.VendorId == nil || uint32(d.VendorID) == cfg.GetVendorId()
 		didChk := cfg.DeviceId == nil || uint32(d.DeviceID) == cfg.GetDeviceId()
 		busChk := len(buses) == 0 || slices.Contains(buses, uint32(d.Bus))
-		pf0Chk := (d.Domain == 0) && (d.Dev == 0) && (d.Func == 0)
+		pf0Chk := (d.Dev == 0) && (d.Func == 0)
 		if vidChk && didChk && busChk && pf0Chk {
 			// Checks the PCIe port type. Only an endpoint or a switch upstream port
 			// are eligible for margining.
