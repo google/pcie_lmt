@@ -36,7 +36,7 @@ import (
 // A Lane conducts a series of timing/voltage margining points
 type Lane struct {
 	cfg        *lmtpb.LinkMargin // The test configuration protobuf.
-	dev        *pci.Dev          // The PCI config access for the port.
+	dev        pci.Dev           // The PCI config access for the port.
 	laneNumber uint32
 	addr       int32                         // The lane address in the LMR config space.
 	rec        lmtpb.LinkMargin_ReceiverEnum // the enumerated receiver number at the 6 Rx points on a link.
@@ -67,7 +67,7 @@ type Lane struct {
 // Init initialized a new Lane instance with the test setup.
 func (ln *Lane) Init(
 	cfg *lmtpb.LinkMargin,
-	dev *pci.Dev,
+	dev pci.Dev,
 	laneNumber int,
 	addr int32,
 	rec lmtpb.LinkMargin_ReceiverEnum,

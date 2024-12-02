@@ -73,7 +73,7 @@ type linktest struct {
 
 // A port is a PCIe device that contains a bunch of lanes. It can be a USP or a DSP.
 type port struct {
-	dev           *pci.Dev // PCI config access for the port.
+	dev           pci.Dev // PCI config access for the port.
 	isUSP         bool
 	width         uint32
 	pcieCapOffset int32 // PCI EXP CAPABILITIES offset
@@ -209,7 +209,7 @@ func MarginLinks(cfg *lmtpb.LinkMargin) error {
 
 	// Gets a list of PCI devices.
 	devs := pci.ScanDevices()
-	if devs == nil {
+	if !devs.Valid() {
 		err := fmt.Errorf("no pcie devices found")
 		return err
 	}
@@ -385,14 +385,14 @@ func ocpTestRunStart(cfg *lmtpb.LinkMargin) {
 var linkwg sync.WaitGroup
 
 // getLinks gets a list of PCIe ports according to the proto param.
-func getLinks(devs *pci.Dev, cfg *lmtpb.LinkMargin) ([]*linktest, error) {
+func getLinks(devs pci.Dev, cfg *lmtpb.LinkMargin) ([]*linktest, error) {
 	var err error
 	const numLinks = 8 // estimated array-initial-size of links to be tested.
 	lts = make([]*linktest, 0, numLinks)
 	buses := cfg.GetBus()
 	// Filters devices by Vid, Did, and/or Bus. Only downstream dev is selected.
 	// This assumes dev number == 0, and func = 0.
-	for dev := devs; dev != nil; dev = dev.GetNext() {
+	for dev := devs; dev.Valid(); dev = dev.GetNext() {
 		d := dev.GetDevInfo()
 		vidChk := cfg.VendorId == nil || uint32(d.VendorID) == cfg.GetVendorId()
 		didChk := cfg.DeviceId == nil || uint32(d.DeviceID) == cfg.GetDeviceId()
@@ -516,7 +516,7 @@ func (p *port) getLMRcapability() (int32, error) {
 
 // getPcieCapOffset scans the PCI capability linked list for PCIe CAP.
 // Refers to pciutils/ls-caps.c
-func getPcieCapOffset(dev *pci.Dev) (int32, error) {
+func getPcieCapOffset(dev pci.Dev) (int32, error) {
 	const (
 		ConfigSpace     = int32(0x100) // The base config space is 256B.
 		CapabilityStart = C.PCI_CAPABILITY_LIST
