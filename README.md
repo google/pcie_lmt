@@ -56,10 +56,17 @@ merchantability, or fitness for a particular purpose.
 
 ## History
 Version: 0.1 : demo
+Version: 1.0 : Not user friendly yet, but useful to those who understand it.
 
 ## Build and Run Commands:
 ```
-bazel build -c opt :lmt \
+# Not yet ported to the bzlmod required by bazel v8.0.1
+# So build with v7.5.0 by using bazelisk
+sudo npm install -g @bazel/bazelisk
+
+USE_BAZEL_VERSION=7.5.0 bazelisk build -c opt :lmt
+
+USE_BAZEL_VERSION=7.5.0 bazelisk build -c opt :lmt \
   --platforms=@io_bazel_rules_go//go/toolchain:linux_arm64_cgo  # ARM support
 bazel run -c opt :lmt -- -h
 

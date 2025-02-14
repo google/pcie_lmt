@@ -386,7 +386,11 @@ func (ln *Lane) MarginLane() error {
 			ln.statusVal.Value = structpb.NewListValue(lv)
 		}
 
-		berThresh := float64(errlimit) / (float64(*t.spec.Dwell) * sps)
+		// BER threshold is calculated as the error_limit / (dwell_time * sample_rate).
+		// Additional 0.5 is added to the error_limit to avoid false failure
+		// when the actual error count is the same as the error_limit,
+		// while the berThresh is text-truncated in meltan artifact.
+		berThresh := (float64(errlimit) + 0.5) / (float64(*t.spec.Dwell) * sps)
 		ln.berVal = &ocppb.Validator{
 			Name:  "Max BER Check",
 			Type:  ocppb.Validator_LESS_THAN_OR_EQUAL,
