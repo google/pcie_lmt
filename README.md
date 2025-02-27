@@ -83,7 +83,7 @@ bazel-bin/lmt_/lmt \
   -csv=dut_lmt_result.csv
 ```
 
-To plot the result in Google Sheets, make a copy of this [Google Sheet](https://docs.google.com/spreadsheets/d/1-do-2YzfelGlOP8fjFp2cVxNchu6K4X05dwvH-HCBaQ0)
+To plot the result in Google Sheets, make a copy of this [Google Sheet](https://docs.google.com/spreadsheets/d/1wdW-EsGtoSaoPytttZcERPhuQAR9PL04kxA6xuGm-hk)
 Then import the dut_lmt_result.csv as a new sheet. Click the menu button `LMT
 Plot` -> `Create Gradient Charts` to plot the charts.
 
