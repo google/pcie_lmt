@@ -1,0 +1,343 @@
+# Copyright 2023 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# proto-file: third_party/pcie_lmt/ltt/ltt.proto
+# proto-message: ltt.LinkTrain
+
+vendor_id: 0x1000
+device_id: 0xc030
+
+bdf: "0000:81:00.0"
+bdf: "0000:a1:00.0"
+
+iterations: 100
+method: M_REENABLE  # Other options are M_SBR or M_RETRAIN_DEFAULT
+training_wait_ms: 1000
+
+continue: true
+parallel: true
+
+field: {
+  name: "VendorID"
+  state: S_LOG
+  addr: 0x0
+  size: UINT16
+  mask: 0xFFFF
+}
+
+field: {
+  name: "DeviceID"
+  state: S_LOG
+  addr: 0x02
+  size: UINT16
+  mask: 0xFFFF
+}
+
+field: {
+  name: "Speed"
+  state: S_CHECK
+  addr: 0x92
+  size: UINT16
+  mask: 0x000F
+  expected: 0x0005
+}
+
+field: {
+  name: "Width"
+  state: S_CHECK
+  addr: 0x92
+  size: UINT16
+  mask: 0x03F0
+  expected: 0x0080
+}
+
+################################################################################
+# The following config space registers are recorded before the link training
+# test, and written back to the config space at the end of the test.
+# This section is the first 64B of the base config space.
+field: {
+  name: "BaseConfigDword00"
+  state: S_RECOVER
+  addr: 0x00
+  size: UINT32
+  mask: 0xFFFFFFFF
+}
+field: {
+  name: "BaseConfigDword04"
+  state: S_RECOVER
+  addr: 0x04
+  size: UINT32
+  mask: 0xFFFFFFFF
+}
+field: {
+  name: "BaseConfigDword08"
+  state: S_RECOVER
+  addr: 0x08
+  size: UINT32
+  mask: 0xFFFFFFFF
+}
+field: {
+  name: "BaseConfigDword0C"
+  state: S_RECOVER
+  addr: 0x0C
+  size: UINT32
+  mask: 0xFFFFFFFF
+}
+field: {
+  name: "BaseConfigDword10"
+  state: S_RECOVER
+  addr: 0x10
+  size: UINT32
+  mask: 0xFFFFFFFF
+}
+field: {
+  name: "BaseConfigDword14"
+  state: S_RECOVER
+  addr: 0x14
+  size: UINT32
+  mask: 0xFFFFFFFF
+}
+field: {
+  name: "BaseConfigDword18"
+  state: S_RECOVER
+  addr: 0x18
+  size: UINT32
+  mask: 0xFFFFFFFF
+}
+field: {
+  name: "BaseConfigDword1C"
+  state: S_RECOVER
+  addr: 0x1C
+  size: UINT32
+  mask: 0xFFFFFFFF
+}
+field: {
+  name: "BaseConfigDword20"
+  state: S_RECOVER
+  addr: 0x20
+  size: UINT32
+  mask: 0xFFFFFFFF
+}
+field: {
+  name: "BaseConfigDword24"
+  state: S_RECOVER
+  addr: 0x24
+  size: UINT32
+  mask: 0xFFFFFFFF
+}
+field: {
+  name: "BaseConfigDword28"
+  state: S_RECOVER
+  addr: 0x28
+  size: UINT32
+  mask: 0xFFFFFFFF
+}
+field: {
+  name: "BaseConfigDword2C"
+  state: S_RECOVER
+  addr: 0x2C
+  size: UINT32
+  mask: 0xFFFFFFFF
+}
+field: {
+  name: "BaseConfigDword30"
+  state: S_RECOVER
+  addr: 0x30
+  size: UINT32
+  mask: 0xFFFFFFFF
+}
+field: {
+  name: "BaseConfigDword34"
+  state: S_RECOVER
+  addr: 0x34
+  size: UINT32
+  mask: 0xFFFFFFFF
+}
+field: {
+  name: "BaseConfigDword38"
+  state: S_RECOVER
+  addr: 0x38
+  size: UINT32
+  mask: 0xFFFFFFFF
+}
+field: {
+  name: "BaseConfigDword3C"
+  state: S_RECOVER
+  addr: 0x3C
+  size: UINT32
+  mask: 0xFFFFFFFF
+}
+# This section is the PCIe Capability.
+field: {
+  name: "PcieDeviceControl"
+  state: S_RECOVER
+  addr: 0x88
+  size: UINT16
+  mask: 0xFFFF
+}
+field: {
+  name: "PcieLinkControl"
+  state: S_RECOVER
+  addr: 0x90
+  size: UINT16
+  mask: 0xFFFF
+}
+field: {
+  name: "PcieRootControl"
+  state: S_RECOVER
+  addr: 0x98
+  size: UINT16
+  mask: 0xFFFF
+}
+field: {
+  name: "PcieSlotControl"
+  state: S_RECOVER
+  addr: 0x9C
+  size: UINT16
+  mask: 0xFFFF
+}
+field: {
+  name: "PcieDeviceControl2"
+  state: S_RECOVER
+  addr: 0xA8
+  size: UINT16
+  mask: 0xFFFF
+}
+field: {
+  name: "PcieLinkControl2"
+  state: S_RECOVER
+  addr: 0xB0
+  size: UINT16
+  mask: 0xFFFF
+}
+field: {
+  name: "PcieSlotControl2"
+  state: S_RECOVER
+  addr: 0xB8
+  size: UINT16
+  mask: 0xFFFF
+}
+# This section is the SR-IOV Capability Structure.
+field: {
+  name: "SRIOVCapDword00"
+  state: S_RECOVER
+  addr: 0x140
+  size: UINT32
+  mask: 0xFFFFFFFF
+}
+field: {
+  name: "SRIOVCapDword04"
+  state: S_RECOVER
+  addr: 0x144
+  size: UINT32
+  mask: 0xFFFFFFFF
+}
+field: {
+  name: "SRIOVCapDword08"
+  state: S_RECOVER
+  addr: 0x148
+  size: UINT32
+  mask: 0xFFFFFFFF
+}
+field: {
+  name: "SRIOVCapDword0C"
+  state: S_RECOVER
+  addr: 0x14C
+  size: UINT32
+  mask: 0xFFFFFFFF
+}
+field: {
+  name: "SRIOVCapDword10"
+  state: S_RECOVER
+  addr: 0x150
+  size: UINT32
+  mask: 0xFFFFFFFF
+}
+field: {
+  name: "SRIOVCapDword14"
+  state: S_RECOVER
+  addr: 0x154
+  size: UINT32
+  mask: 0xFFFFFFFF
+}
+field: {
+  name: "SRIOVCapDword18"
+  state: S_RECOVER
+  addr: 0x158
+  size: UINT32
+  mask: 0xFFFFFFFF
+}
+field: {
+  name: "SRIOVCapDword1C"
+  state: S_RECOVER
+  addr: 0x15C
+  size: UINT32
+  mask: 0xFFFFFFFF
+}
+field: {
+  name: "SRIOVCapDword20"
+  state: S_RECOVER
+  addr: 0x160
+  size: UINT32
+  mask: 0xFFFFFFFF
+}
+field: {
+  name: "SRIOVCapDword24"
+  state: S_RECOVER
+  addr: 0x164
+  size: UINT32
+  mask: 0xFFFFFFFF
+}
+field: {
+  name: "SRIOVCapDword28"
+  state: S_RECOVER
+  addr: 0x168
+  size: UINT32
+  mask: 0xFFFFFFFF
+}
+field: {
+  name: "SRIOVCapDword2C"
+  state: S_RECOVER
+  addr: 0x16C
+  size: UINT32
+  mask: 0xFFFFFFFF
+}
+field: {
+  name: "SRIOVCapDword30"
+  state: S_RECOVER
+  addr: 0x170
+  size: UINT32
+  mask: 0xFFFFFFFF
+}
+field: {
+  name: "SRIOVCapDword34"
+  state: S_RECOVER
+  addr: 0x174
+  size: UINT32
+  mask: 0xFFFFFFFF
+}
+field: {
+  name: "SRIOVCapDword38"
+  state: S_RECOVER
+  addr: 0x178
+  size: UINT32
+  mask: 0xFFFFFFFF
+}
+field: {
+  name: "SRIOVCapDword3C"
+  state: S_RECOVER
+  addr: 0x17C
+  size: UINT32
+  mask: 0xFFFFFFFF
+}

@@ -33,8 +33,8 @@ message LinkMargin {
   optional uint32 vendor_id = 1;
   optional uint32 device_id = 2;
   // Assumes domain==0, device==0, and function=0
-  // USPs can also be chosen by bus numbers with or without the IDs.
-  repeated uint32 bus = 4;
+  // USPs can also be chosen by BDFs in the format of "0000:00:00.0".
+  repeated string bdf = 4;
   optional string usp_bdf = 5;  // reported USP's BDF in the link under test.
   optional string dsp_bdf = 6;  // reported DSP's BDF in the link under test.
   optional string message = 7;  // Some info log from testing on a link.

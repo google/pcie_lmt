@@ -1,0 +1,100 @@
+// Copyright 2023 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// PCI config space proto used for PCIe link training test, for both the input
+// and the result.
+syntax = "proto3";
+
+package ltt;
+
+option go_package = 'ltt_go_proto';
+
+message LinkTrainTests {
+  repeated LinkTrain link_train = 1;
+}
+
+message LinkTrain {
+  // The following optional fields are use to select PCIe Upstream Port (USP)
+  // in the system to conduct the link training test.
+  // USPs can be chosen by vendor and device IDs.
+  optional uint32 vendor_id = 1;
+  optional uint32 device_id = 2;
+
+  // USPs can also be chosen by BDFs in the format of "0000:00:00.0".
+  repeated string bdf = 3;
+
+  // USP and DSP's BDF, where secondary bus reset is issued.
+  optional string usp_bdf = 4;
+  optional string dsp_bdf = 5;
+  int32 iterations = 6;  // number of link training iterations
+
+  optional int32 pass_count = 7;  // number of successful link training
+  optional int32 fail_count = 8;  // number of failed link training
+
+  // If not set or true, the iterations continue after the first failure.
+  optional bool continue = 9;
+
+  // Link training methods
+  enum Method {
+    M_RETRAIN_DEFAULT = 0;  // Link Retrain, the default
+    M_SBR = 1;              // Secondary Bus Reset
+    M_REENABLE = 2;         // Link disable and re-enable
+  }
+
+  Method method = 10;
+
+  // Wait time per training iteration in ms, normally 100ms for all methods.
+  uint32 training_wait_ms = 11;
+
+  // Only when set to true, test each link in parallel, otherwise, in series.
+  optional bool parallel = 12;
+  optional string extra_info = 13;
+
+  // This message defines a PCI config space field to be checked or logged.
+  message PciConfigField {
+    string name = 1;  // name of the field; no functional use
+
+    enum StateEnum {
+      S_LOG = 0;      // to be logged
+      S_LOGGED = 1;   // logged
+      S_CHECK = 2;    // to be checked
+      S_PASS = 3;     // checked and the value is expected
+      S_FAIL = 4;     // checked and the value is not expected
+      S_ERROR = 5;    // This field definition has error
+      S_RECOVER = 6;  // Record before testing and write-back after.
+    }
+
+    StateEnum state = 2;
+
+    // The field's byte offset into the config space
+    uint32 addr = 3;
+
+    // Width of the field.
+    enum SizeEnum {
+      UINT8 = 0;
+      UINT16 = 1;
+      UINT32 = 2;
+      UINT64 = 3;
+    }
+
+    SizeEnum size = 4;
+
+    uint32 mask = 5;  // bit mask of the field.
+
+    optional uint32 val = 6;       // logged value
+    optional uint32 expected = 7;  // expected value for checking
+  }
+
+  repeated PciConfigField field = 15;
+}

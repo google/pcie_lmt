@@ -1,5 +1,8 @@
 # PCIe-LMT (PCIe Lane Margin Test)
+> ## sidedish: [PCIe-LTT](ltt/README.md) (Link Training Test)
 
+\
+\
 The LMT (Lane Margin Test) checks the signal quality of the PCIe link. The test
 utilizes the PCIe Lane Margining at Receiver (LMR) feature. The LMR is specified
 in PCIe Base Spec 5.0 sections 4.2.13, 7.7.7 and 8.4.4. The LMR samples bits at each offset away from
@@ -68,9 +71,11 @@ USE_BAZEL_VERSION=7.5.0 bazelisk build -c opt :lmt
 
 USE_BAZEL_VERSION=7.5.0 bazelisk build -c opt :lmt \
   --platforms=@io_bazel_rules_go//go/toolchain:linux_arm64_cgo  # ARM support
-bazel run -c opt :lmt -- -h
 
-bazel run -c opt :lmt -- -alsologtostderr -v=0 \
+USE_BAZEL_VERSION=7.5.0 bazelisk run -c opt :lmt -- -h
+
+bazel-bin/lmt_/lmt \
+  -alsologtostderr -v=0 \
   -spec=dut_lmt_spec.pbtxt \
   -result=dut_lmt_result.pbtxt \
   -csv=dut_lmt_result.csv \
