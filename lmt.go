@@ -43,7 +43,8 @@ var (
 	getVer   = flag.Bool("version", false, "Return the version number.")
 	vid      = flag.Int("vendor_id", -1, "The 16-bit Vendor ID of the USP (such as the EP).")
 	did      = flag.Int("device_id", -1, "The 16-bit Device ID of the USP (such as the EP).")
-	bus      = flag.String("bus", "", "A comma-separted list of bus numbers.")
+	bus      = flag.String("bus", "", "Deprecated. Use -bdf instead. A comma-separted list of bus numbers.")
+	bdf      = flag.String("bdf", "", "A comma-separted list of DDDD:BB:dd:f numbers.")
 	spec     = flag.String("spec", "", "The test spec .pbtxt file.")
 	specJSON = flag.String("spec_json", "", "The test spec .json file.")
 	result   = flag.String("result", "result.pbtxt", "The result pbtxt file name.")
@@ -111,12 +112,34 @@ func main() {
 	if *bus != "" {
 		busList := strings.Split(*bus, ",")
 		if len(busList) != 0 {
-			cfg.Bus = ([]uint32{})
+			cfg.Bdf = ([]string{})
 			for _, busstr := range busList {
 				if bus, err := strconv.ParseUint(busstr, 0, 32); err != nil {
 					log.Error(busstr, " is not a valid bus number format.")
 				} else {
-					cfg.Bus = append(cfg.GetBus(), uint32(bus))
+					cfg.Bdf = append(cfg.GetBdf(), fmt.Sprintf("%04x:%02x:%02x.%d", 0, bus, 0, 0) )
+				}
+			}
+		}
+	}
+
+	if *bdf != "" {
+		bdfList := strings.Split(*bdf, ",")
+		if len(bdfList) != 0 {
+			cfg.Bdf = ([]string{})
+			for _, bdfstr := range bdfList {
+				domain := uint16(0)
+				b := uint8(0)
+				d := uint8(0)
+				f := uint8(0)
+				if n, _ := fmt.Sscanf(bdfstr, "%04x:%02x:%02x.%d", &domain, &b, &d, &f); n == 4 {
+					cfg.Bdf = append(cfg.GetBdf(), fmt.Sprintf("%04x:%02x:%02x.%d", domain, b, d, f))
+					continue
+				} else if n, _ := fmt.Sscanf(bdfstr, "%02x", &b); n == 1 {
+					cfg.Bdf = append(cfg.GetBdf(), fmt.Sprintf("%04x:%02x:%02x.%d", 0, b, 0, 0))
+					continue
+				} else {
+					log.Error(bdfstr, " is not a valid BDF in DDDD:BB:dd:f format.")
 				}
 			}
 		}

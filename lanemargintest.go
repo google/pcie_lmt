@@ -173,6 +173,19 @@ func ReadLinkMargin(fn string, isJSON bool) (*lmtpb.LinkMargin, error) {
 	return cfg, nil
 }
 
+//  bdfToUnit32 converts a BDF string to a uint32 for comparing.
+func bdf2u32(bdf string) uint32 {
+	domain := uint16(0)
+	b := uint8(0)
+	d := uint8(0)
+	f := uint8(0)
+	if n, _ := fmt.Sscanf(bdf, "%04x:%02x:%02x.%d", &domain, &b, &d, &f); n == 4 {
+		return uint32(domain)<<16 | uint32(b)<<8 | uint32(d)<<3 | uint32(f)
+	} else {
+		return 0
+	}
+}
+
 // WriteResultPbtxt writes out the test results from the lts to a textproto.
 func WriteResultPbtxt(outfn string) error {
 	// Marshal test results into pbtxt bytes per lk.
@@ -182,7 +195,7 @@ func WriteResultPbtxt(outfn string) error {
 		lms = append(lms, lt.pb)
 	}
 	// Sorts the result pb message by bus number.
-	sort.SliceStable(lms, func(i, j int) bool { return lms[i].GetBus()[0] < lms[j].GetBus()[0] })
+	sort.SliceStable(lms, func(i, j int) bool { return bdf2u32(lms[i].GetUspBdf()) < bdf2u32(lms[j].GetUspBdf()) })
 	lmts.LinkMargin = lms
 	opt := &prototext.MarshalOptions{
 		Multiline:    true,
@@ -389,16 +402,15 @@ func getLinks(devs pci.Dev, cfg *lmtpb.LinkMargin) ([]*linktest, error) {
 	var err error
 	const numLinks = 8 // estimated array-initial-size of links to be tested.
 	lts = make([]*linktest, 0, numLinks)
-	buses := cfg.GetBus()
 	// Filters devices by Vid, Did, and/or Bus. Only downstream dev is selected.
 	// This assumes dev number == 0, and func = 0.
 	for dev := devs; dev.Valid(); dev = dev.GetNext() {
 		d := dev.GetDevInfo()
 		vidChk := cfg.VendorId == nil || uint32(d.VendorID) == cfg.GetVendorId()
 		didChk := cfg.DeviceId == nil || uint32(d.DeviceID) == cfg.GetDeviceId()
-		busChk := len(buses) == 0 || slices.Contains(buses, uint32(d.Bus))
+		bdfChk := len(cfg.GetBdf()) == 0 || slices.Contains(cfg.GetBdf(), fmt.Sprintf("%04x:%02x:%02x.%d", d.Domain, d.Bus, d.Dev, d.Func))
 		pf0Chk := (d.Dev == 0) && (d.Func == 0)
-		if vidChk && didChk && busChk && pf0Chk {
+		if vidChk && didChk && bdfChk && pf0Chk {
 			// Checks the PCIe port type. Only an endpoint or a switch upstream port
 			// are eligible for margining.
 			if offset, err := getPcieCapOffset(dev); err != nil {
@@ -435,7 +447,7 @@ func getLinks(devs pci.Dev, cfg *lmtpb.LinkMargin) ([]*linktest, error) {
 			lt.pb.VendorId = &vendorID
 			deviceID := uint32(d.DeviceID)
 			lt.pb.DeviceId = &deviceID
-			lt.pb.Bus = ([]uint32{uint32(d.Bus)})
+			lt.pb.Bdf = ([]string{dev.BDFString()})
 			uspBdf := dev.BDFString()
 			lt.pb.UspBdf = &uspBdf
 			dspBdf := lt.dsp.dev.BDFString()

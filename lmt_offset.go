@@ -207,8 +207,8 @@ looping:
 		}
 	}
 	fmt.Printf(
-		"Point margin: Bus:%02x Rx:%-9s Ln:%2d  Dir:%-8s Step:%3d  Status:%-13s ErrCnt:%2d  Samples:%3d\n",
-		ln.cfg.GetBus()[0], ln.rec.String(), ln.laneNumber, point.GetDirection().String(),
+		"Point margin: BDF:%s Rx:%-9s Ln:%2d  Dir:%-8s Step:%3d  Status:%-13s ErrCnt:%2d  Samples:%3d\n",
+		ln.cfg.GetBdf()[0], ln.rec.String(), ln.laneNumber, point.GetDirection().String(),
 		point.GetSteps(), point.GetStatus().String(), point.GetErrorCount(), point.GetSampleCount())
 
 	if point.GetStatus() != lmtpb.LinkMargin_Lane_MarginPoint_S_MARGINING {
@@ -233,8 +233,8 @@ looping:
 	subcomp := &ocppb.Subcomponent{
 		Type: ocppb.Subcomponent_BUS,
 		Name: "PCIELMT-MARGINPOINT-PCI",
-		Location: fmt.Sprintf("BUS=%02xh;RX=%1d;LN=%02d;Offset=%s",
-			ln.cfg.GetBus()[0], ln.rec.Number(), ln.laneNumber, ocpName),
+		Location: fmt.Sprintf("BDF=%s;RX=%1d;LN=%02d;Offset=%s",
+			ln.cfg.GetBdf()[0], ln.rec.Number(), ln.laneNumber, ocpName),
 	}
 
 	if !ln.eyeScanMode || point.GetStatus() != lmtpb.LinkMargin_Lane_MarginPoint_S_MARGINING {

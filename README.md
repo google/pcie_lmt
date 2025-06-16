@@ -1,5 +1,8 @@
 # PCIe-LMT (PCIe Lane Margin Test)
+> ## sidedish: [PCIe-LTT](ltt/README.md) (Link Training Test)
 
+\
+\
 The LMT (Lane Margin Test) checks the signal quality of the PCIe link. The test
 utilizes the PCIe Lane Margining at Receiver (LMR) feature. The LMR is specified
 in PCIe Base Spec 5.0 sections 4.2.13, 7.7.7 and 8.4.4. The LMR samples bits at each offset away from
@@ -55,7 +58,7 @@ Google and Google specifically disclaims all warranties as to its quality,
 merchantability, or fitness for a particular purpose.
 
 ## History
-Version: 0.1 : demo  
+Version: 0.1 : demo
 Version: 1.0 : Not user friendly yet, but useful to those who understand it.
 
 ## Build and Run Commands:
@@ -68,9 +71,11 @@ USE_BAZEL_VERSION=7.5.0 bazelisk build -c opt :lmt
 
 USE_BAZEL_VERSION=7.5.0 bazelisk build -c opt :lmt \
   --platforms=@io_bazel_rules_go//go/toolchain:linux_arm64_cgo  # ARM support
-bazel run -c opt :lmt -- -h
 
-bazel run -c opt :lmt -- -alsologtostderr -v=0 \
+USE_BAZEL_VERSION=7.5.0 bazelisk run -c opt :lmt -- -h
+
+bazel-bin/lmt_/lmt \
+  -alsologtostderr -v=0 \
   -spec=dut_lmt_spec.pbtxt \
   -result=dut_lmt_result.pbtxt \
   -csv=dut_lmt_result.csv \
@@ -83,7 +88,7 @@ bazel-bin/lmt_/lmt \
   -csv=dut_lmt_result.csv
 ```
 
-To plot the result in Google Sheets, make a copy of this [Google Sheet](https://docs.google.com/spreadsheets/d/1wdW-EsGtoSaoPytttZcERPhuQAR9PL04kxA6xuGm-hk)
+To plot the result in Google Sheets, make a copy of this [Google Sheet](https://docs.google.com/spreadsheets/d/1-do-2YzfelGlOP8fjFp2cVxNchu6K4X05dwvH-HCBaQ0)
 Then import the dut_lmt_result.csv as a new sheet. Click the menu button `LMT
 Plot` -> `Create Gradient Charts` to plot the charts.
 

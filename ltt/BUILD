@@ -21,36 +21,30 @@ load("@rules_proto//proto:defs.bzl", "proto_library")
 gazelle(name = "gazelle")
 
 proto_library(
-    name = "lmt_proto",
-    srcs = ["lmt.proto"],
+    name = "ltt_proto",
+    srcs = ["ltt.proto"],
     visibility = ["//visibility:public"],
 )
 
 go_proto_library(
-    name = "lmt_go_proto",
-    importpath = "lmt_go.proto",
-    proto = ":lmt_proto",
+    name = "ltt_go_proto",
+    importpath = "ltt_go.proto",
+    proto = ":ltt_proto",
 )
 
 go_library(
-    name = "lanemargintest",
+    name = "linktrain",
     srcs = [
-        "lanemargintest.go",
-        "lmt_cmdrsp.go",
-        "lmt_lane.go",
-        "lmt_link.go",
-        "lmt_offset.go",
-        "lmt_result2csv.go",
-        "lmt_tally.go",
+        "linktrain.go",
     ],
     cdeps = [
         "@pciutils//:libpci",
     ],
     cgo = 1,
-    importpath = "local/lanemargintest",
+    importpath = "local/linktrain",
     deps = [
-        ":lmt_go_proto",
-        ":pciutils",
+        ":ltt_go_proto",
+        "//:pciutils",
         "@com_github_golang_glog//:go_default_library",
         "@ocpdiag//:results_go_proto",
         "@org_golang_google_protobuf//encoding/protojson",
@@ -61,35 +55,21 @@ go_library(
     ],
 )
 
-# bazel build //:lmt \
+# bazel build //:ltt \
 #   --platforms=@io_bazel_rules_go//go/toolchain:linux_arm64_cgo
 go_binary(
-    name = "lmt",
-    srcs = ["lmt.go"],
+    name = "ltt",
+    srcs = ["ltt.go"],
     x_defs = {
         "main.version": "{VERSION}",
         "main.buildTime": "{BUILD_TIME}",
     },
     deps = [
-        ":lanemargintest",
+        ":linktrain",
+        ":ltt_go_proto",
         "@com_github_golang_glog//:go_default_library",
         "@ocpdiag//:results_go_proto",
         "@org_golang_google_protobuf//encoding/protojson",
         "@org_golang_google_protobuf//types/known/structpb",
-    ],
-)
-
-go_library(
-    name = "pciutils",
-    srcs = ["pciutils.go"],
-    cdeps = [
-        "@pciutils//:libpci",
-    ],
-    cgo = 1,
-    clinkopts = ["-static"],
-    importpath = "pciutils",
-    visibility = ["//visibility:public"],
-    deps = [
-        "@com_github_golang_glog//:go_default_library",
     ],
 )
