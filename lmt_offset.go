@@ -38,7 +38,7 @@ const (
 // receiver Lane. The result is logged in a LinkMargin_Lane_MarginPoint.
 // The offset includes the direction bit, [6] for timing and [7] for voltage.
 // The offset is used as the command payload as is.
-func (ln *Lane) margin(offset uint16, vNotT bool, sps float64) (
+func (ln *Lane) margin(offset uint16, t *aspect) (
 	*lmtpb.LinkMargin_Lane_MarginPoint, error) {
 
 	// Creates a new MarginPoint message.
@@ -61,9 +61,8 @@ func (ln *Lane) margin(offset uint16, vNotT bool, sps float64) (
 	// Identifies the up-down/left-right directions
 	var dir lmtpb.LinkMargin_Lane_MarginPoint_DirectionEnum
 	var steps uint16
-	var dwell time.Duration
 	var ocpName string
-	if vNotT {
+	if t.VnotT {
 		cmd.typ = MarginTypeVoltage
 		steps = offset &^ VoltageDirMask
 		vv := float32(steps) *
@@ -82,7 +81,6 @@ func (ln *Lane) margin(offset uint16, vNotT bool, sps float64) (
 			dir = lmtpb.LinkMargin_Lane_MarginPoint_D_UD
 			ocpName = fmt.Sprintf("V:%fV", vv)
 		}
-		dwell = time.Duration(ln.Vspec.GetDwell()) * time.Second
 	} else {
 		cmd.typ = MarginTypeTiming
 		steps = offset &^ TimingDirMask
@@ -102,7 +100,6 @@ func (ln *Lane) margin(offset uint16, vNotT bool, sps float64) (
 			dir = lmtpb.LinkMargin_Lane_MarginPoint_D_LR
 			ocpName = fmt.Sprintf("T:%fUI", ui)
 		}
-		dwell = time.Duration(ln.Tspec.GetDwell()) * time.Second
 	}
 	point.Direction = dir
 	point.Steps = uint32(steps)
@@ -166,7 +163,7 @@ looping:
 			// This is the case pb.LinkMargin_Lane_MarginPoint_S_MARGINING.
 			// Margining is in progress.
 			point.Status = lmtpb.LinkMargin_Lane_MarginPoint_S_MARGINING
-			if time.Since(t0) >= dwell {
+			if dwellActual >= t.dwell {
 				// Exists loop when time is up.
 				setSampleCount = true
 				break looping
@@ -185,7 +182,7 @@ looping:
 		if ln.param.GetSampleReportingMethod() || !ln.param.GetIndErrorSampler() {
 			// The samples are counted by rate * dwell.
 			// AMD CPU does not have error sampler. It also does not report a sample count.
-			bitCount = dwellActual.Seconds() * sps // Actual dwell * samples per second
+			bitCount = dwellActual.Seconds() * t.sps // Actual dwell * samples per second
 			// Refers to PCIe 5.0 spec 8.4.4: SampleCount = 3*log 2 (number of bits)
 			if bitCount == 0 {
 				samples := uint32(18) // 64 bits is for practical reason to differ from the default 0.
@@ -213,7 +210,7 @@ looping:
 
 	if point.GetStatus() != lmtpb.LinkMargin_Lane_MarginPoint_S_MARGINING {
 		if point.GetStatus() == lmtpb.LinkMargin_Lane_MarginPoint_S_ERROR_OUT {
-			if !ln.eyeScanMode && !ln.eyeSizeCheck {
+			if !t.errOutOK {
 				ln.Pass = false
 			}
 		} else {
@@ -223,7 +220,7 @@ looping:
 
 	// Stream OCP TestStepMeasurement artifact
 	var unit string
-	if vNotT {
+	if t.VnotT {
 		unit = fmt.Sprintf("Unit=V;Step=%03d;Dir=%-8s;Offset=%6.4f",
 			point.GetSteps(), strings.TrimPrefix(point.GetDirection().String(), "D_"), point.GetVoltage())
 	} else {
@@ -237,7 +234,7 @@ looping:
 			ln.cfg.GetBdf()[0], ln.rec.Number(), ln.laneNumber, ocpName),
 	}
 
-	if !ln.eyeScanMode || point.GetStatus() != lmtpb.LinkMargin_Lane_MarginPoint_S_MARGINING {
+	if !t.eyeScanMode || point.GetStatus() != lmtpb.LinkMargin_Lane_MarginPoint_S_MARGINING {
 		m := &ocppb.Measurement{
 			Name:           fmt.Sprintf("LN=%02d;Step-Status", ln.laneNumber),
 			Value:          structpb.NewStringValue(strings.TrimPrefix(point.GetStatus().String(), "S_")),
@@ -251,7 +248,7 @@ looping:
 	}
 
 	if (point.GetStatus() == lmtpb.LinkMargin_Lane_MarginPoint_S_MARGINING ||
-		point.GetStatus() == lmtpb.LinkMargin_Lane_MarginPoint_S_ERROR_OUT) && (!ln.eyeScanMode ||
+		point.GetStatus() == lmtpb.LinkMargin_Lane_MarginPoint_S_ERROR_OUT) && (!t.eyeScanMode ||
 		point.ErrorCount != 0) {
 		m := &ocppb.Measurement{
 			Name:           fmt.Sprintf("LN=%02d;Step-BER", ln.laneNumber),
@@ -260,7 +257,7 @@ looping:
 			HardwareInfoId: ln.rx.hwinfo,
 			Subcomponent:   subcomp,
 		}
-		if !ln.eyeScanMode && !ln.eyeSizeCheck {
+		if !t.errOutOK {
 			m.Validators = []*ocppb.Validator{ln.berVal}
 		}
 		ln.mStepArti.Artifact = &ocppb.TestStepArtifact_Measurement{Measurement: m}

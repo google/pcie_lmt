@@ -31,6 +31,18 @@ import (
 	pci "pciutils"
 )
 
+// Pass/Fail enum
+const (
+	pass = iota // 0
+	fail        // 1
+)
+
+// Pos/Neg enum
+const (
+	pos = iota // 0
+	neg        // 1
+)
+
 // /////////////////////////////////////////////////////////////////////////////////////////////////
 
 // A Lane conducts a series of timing/voltage margining points
@@ -44,19 +56,17 @@ type Lane struct {
 	speed      float64                // bps: Gen4:16E9, Gen5:32E9
 	lane       *lmtpb.LinkMargin_Lane // The lane result protobuf.
 	// The following are result messages under the lane protobuf.
-	param        *lmtpb.LinkMargin_Lane_Parameters
-	Vspec        *lmtpb.LinkMargin_TestSpec
-	Tspec        *lmtpb.LinkMargin_TestSpec
-	tsteps       []*lmtpb.LinkMargin_Lane_MarginPoint
-	vsteps       []*lmtpb.LinkMargin_Lane_MarginPoint
-	msg          string
-	Pass         bool            // This member exports the pass/fail status of the lane.
-	rxwg         *sync.WaitGroup // Wait for the receiver port.
-	linkwg       *sync.WaitGroup // Wait for all links.
-	eyeWidth     float32
-	eyeHeight    float32
-	eyeScanMode  bool // When the target_offset is not set, the test spec is in eye-scan mode.
-	eyeSizeCheck bool // When the eye_size is set, the test spec check for size rather than margin.
+	param     *lmtpb.LinkMargin_Lane_Parameters
+	Vspec     *lmtpb.LinkMargin_TestSpec
+	Tspec     *lmtpb.LinkMargin_TestSpec
+	tsteps    []*lmtpb.LinkMargin_Lane_MarginPoint
+	vsteps    []*lmtpb.LinkMargin_Lane_MarginPoint
+	msg       string
+	Pass      bool            // This member exports the pass/fail status of the lane.
+	rxwg      *sync.WaitGroup // Wait for the receiver port.
+	linkwg    *sync.WaitGroup // Wait for all links.
+	eyeWidth  float32
+	eyeHeight float32
 	// OCP JSON message output
 	stepArtiOut *ocppb.OutputArtifact
 	mStepArti   *ocppb.TestStepArtifact
@@ -111,6 +121,66 @@ const (
 	defaultMaxVoltageOffset = 50
 )
 
+// This is a test config to distinguish between timing and voltage margining.
+type aspect struct {
+	VnotT       bool
+	spec        *lmtpb.LinkMargin_TestSpec
+	steps       uint32
+	maxOffset   float32
+	rate        uint32
+	indDir      bool // independent left/right or up/down
+	dirmask     uint16
+	mp          [2][2]*lmtpb.LinkMargin_Lane_MarginPoint // [Pos/Neg][Pass/Fail]
+	dwell       time.Duration
+	bitCount    float64
+	sps         float64
+	berThresh   float64
+	start       uint16
+	target      uint16
+	step        uint16
+	eyeScanMode bool
+	targetMode  bool
+	eyeSizeMode bool
+	untilFail   bool
+	errOutOK    bool
+}
+
+// MarginLane performs series of margining at steps.
+func (ln *Lane) MarginLane() error {
+	var msg strings.Builder
+	defer func() {
+		ln.msg = msg.String()
+	}()
+
+	// Reads Lane parameters
+	if err := ln.readLaneParameters(); err != nil {
+		log.Errorf("Failed to read lane parameters for lane %d: %v", ln.laneNumber, err)
+		ln.rxwg.Done()
+		return err
+	}
+
+	ln.rxwg.Done()
+	// Waits for all the lanes (if in parallel) to finish reading the parameter.
+	ln.rxwg.Wait()
+	ln.linkwg.Wait()
+
+	aspects := ln.prepareMarginTests(&msg)
+
+	// Executes the prepared test specs.
+	for i := range aspects {
+		if err := ln.testAspect(&aspects[i], &msg); err != nil {
+			// Log error and continue to next test type if desired, or return error to stop all tests.
+			log.Errorf("Error executing test for lane %d: %v", ln.laneNumber, err)
+			return err
+		}
+	}
+
+	// ln.lane != nil is an indication that the margining is done maturely.
+	ln.lane = new(lmtpb.LinkMargin_Lane)
+
+	return nil
+}
+
 // readLaneParameters() reads the Lane margining capability parameters from each
 // Lane.
 func (ln *Lane) readLaneParameters() error {
@@ -120,10 +190,23 @@ func (ln *Lane) readLaneParameters() error {
 	var rsp *cmdRsp
 	var err error
 	var cmd cmdRsp
+
+	// clears error logs and sets the lane to normal settings.
+	cmd.rec = uint16(ln.rec)
+	cmd.usage = UsageModel
+	cmd.typ = MarginTypeSet
+	cmd.payload = SetClearErrorLog
+	if err := ln.lmrCmdRspEcho(&cmd); err != nil {
+		return fmt.Errorf("failed to clear error log: %w", err)
+	}
+	cmd.payload = SetGoToNormalSettings
+	if err := ln.lmrCmdRspEcho(&cmd); err != nil {
+		return fmt.Errorf("failed to set to normal settings: %w", err)
+	}
+
 	cmd.rec = uint16(ln.rec)
 	cmd.usage = UsageModel
 	cmd.typ = MarginTypeReport
-
 	cmd.payload = RptControlCapabilities
 	if rsp, err = ln.lmrCmdRsp(&cmd); err != nil {
 		return err
@@ -209,327 +292,454 @@ func (ln *Lane) readLaneParameters() error {
 	return nil
 }
 
-// MarginLane performs series of margining at steps.
-func (ln *Lane) MarginLane() error {
-	var msg strings.Builder
-	defer func() {
-		ln.msg = msg.String()
-	}()
-	var err error
-	var cmd cmdRsp
-
-	// Clears error log and goes to normal settings.
-	cmd.rec = uint16(ln.rec)
-	cmd.usage = UsageModel
-	cmd.typ = MarginTypeSet
-	cmd.payload = SetClearErrorLog
-	if err := ln.lmrCmdRspEcho(&cmd); err != nil {
-		return err
-	}
-	cmd.payload = SetGoToNormalSettings
-	if err := ln.lmrCmdRspEcho(&cmd); err != nil {
-		return err
-	}
-
-	// Reads Lane parameters
-	ln.readLaneParameters()
+// prepareMarginTests creates the list of timing and/or voltage tests to run.
+func (ln *Lane) prepareMarginTests(msg *strings.Builder) []aspect {
+	aspects := make([]aspect, 0, 2)
 	param := ln.param
 
-	ln.rxwg.Done()
-	// Waits for all the lanes (if in parallel) to finish reading the parameter.
-	ln.rxwg.Wait()
-	ln.linkwg.Wait()
-
-	// This is a test config to distinguish between timing and voltage margining.
-	type test struct {
-		VnotT   bool
-		spec    *lmtpb.LinkMargin_TestSpec
-		steps   uint32
-		rate    uint32
-		indDir  bool // independent left/right or up/down
-		dirmask uint16
-	}
-	tests := make([]test, 0, 2)
-
 	// Margins timing if specified
-	tt := test{
-		VnotT:   false,
-		spec:    ln.Tspec,
-		steps:   param.GetNumTimingSteps(),
-		rate:    param.GetSamplingRateTiming(),
-		indDir:  param.GetIndLeftRightTiming(),
-		dirmask: TimingDirMask}
-
 	if ln.Tspec != nil {
-		tt.spec = ln.Tspec
-		tests = append(tests, tt)
+		aspects = append(aspects, aspect{
+			VnotT:     false,
+			spec:      ln.Tspec,
+			steps:     param.GetNumTimingSteps(),
+			maxOffset: float32(param.GetMaxTimingOffset()) / 100.0, // in UI, 50 = 50%UI
+			rate:      param.GetSamplingRateTiming(),
+			indDir:    param.GetIndLeftRightTiming(),
+			dirmask:   TimingDirMask,
+		})
 	} else {
 		msg.WriteString("Timing margining not specified. | ")
 	}
 
 	// Margins voltage if supported and specified
-	vt := test{
-		VnotT:   true,
-		spec:    ln.Vspec,
-		steps:   param.GetNumVoltageSteps(),
-		rate:    param.GetSamplingRateVoltage(),
-		indDir:  param.GetIndUpDownVoltage(),
-		dirmask: VoltageDirMask}
-
-	if !param.GetVoltageSupported() {
-		ln.Vspec = nil
-		vt.spec = ln.Vspec
-		msg.WriteString("Voltage margining not supported. | ")
-	} else if ln.Vspec != nil {
-		vt.spec = ln.Vspec
-		tests = append(tests, vt)
+	if ln.Vspec != nil {
+		if param.GetVoltageSupported() {
+			aspects = append(aspects, aspect{
+				VnotT:     true,
+				spec:      ln.Vspec,
+				steps:     param.GetNumVoltageSteps(),
+				maxOffset: float32(param.GetMaxVoltageOffset()) / 100.0, // in Volts 50 = 0.5V
+				rate:      param.GetSamplingRateVoltage(),
+				indDir:    param.GetIndUpDownVoltage(),
+				dirmask:   VoltageDirMask,
+			})
+		} else {
+			msg.WriteString("Voltage margining specified but voltage not supported. | ")
+			ln.Vspec = nil // Ensure Vspec is nil if not supported
+		}
 	} else {
 		msg.WriteString("Voltage margining not specified. | ")
 	}
+	return aspects
+}
 
-	// Executes the prepared test specs.
-	for _, t := range tests {
-		errlimit := uint16(t.spec.GetErrorLimit())
-		cmd.typ = MarginTypeSet
-		cmd.payload = SetErrorCountLimit | errlimit
-		if err = ln.lmrCmdRspEcho(&cmd); err != nil {
-			msg.WriteString(err.Error() + " | ")
-			return err
-		}
+// testAspect executes one test from the list.
+func (ln *Lane) testAspect(t *aspect, msg *strings.Builder) error {
+	if t.spec.StartOffset == nil && t.spec.TargetOffset == nil && t.spec.EyeSize == nil {
+		log.Warningf("Lane %d: Test spec is empty, skipping", ln.laneNumber)
+		return nil
+	}
 
-		// Assumes max sampling rate if it reads 0, and independent error sampler is
-		// not supported or reporting method is count not rate.
-		if t.rate == 0 && (!ln.param.GetIndErrorSampler() || !ln.param.GetSampleReportingMethod()) {
-			t.rate = 63
-		}
-		// Calculates minimum dwell time based on bits to be sampled.
-		// Refers to PCIe 5.0 spec 8.4.4: SampleCount = 3*log 2 (number of bits)
-		bitCount := math.Pow(2.0, float64(t.spec.GetSamples())/3.0)
-		log.V(1).Infoln("Sample bit count = ", bitCount)
-		// Samples per second. t.rate is define as the # of bits checked out of 64 bits, - 1.
-		sps := (float64(t.rate+1) / 64.0) * ln.speed
-		log.V(1).Infoln("Sample per second = ", sps)
-		// Expected dwell is bitCount / sampleRate / speed
-		dwell := time.Duration(math.Ceil(bitCount/sps)) * time.Second
-		log.V(1).Infoln("Calculated dwell = ", dwell)
+	ln.calculateDwellTime(t)
+	ln.setupLaneValidators(t)
+	err := ln.setErrLimit(t, msg)
+	if err != nil {
+		return err
+	}
 
-		// If greater dwell is specified, use that.
-		if t.spec.Dwell == nil || dwell > time.Duration(*t.spec.Dwell)*time.Second {
-			dwellSeconds := (float32(dwell.Seconds()))
-			t.spec.Dwell = &dwellSeconds
-		}
+	ln.determineMarginRange(t)
 
-		if t.spec.StartOffset == nil && t.spec.TargetOffset == nil {
-			log.Error("Either the start_offset or the target_offset must be specified. Margining skipped.")
-			continue
-		}
-		// Sets the starting and ending steps.
-		var untilFail bool
-		var target, start uint16
-		if t.spec.TargetOffset != nil {
-			untilFail = false
-			// Set the target max offset to be no greater than the Lane's capability.
-			if *t.spec.TargetOffset > t.steps {
-				t.spec.TargetOffset = &t.steps
-			}
-			target = uint16(t.spec.GetTargetOffset())
-		} else {
-			// Explore until fail mode
-			untilFail = true
-			target = uint16(t.steps)
-		}
-		if t.spec.StartOffset != nil {
-			start = uint16(*t.spec.StartOffset)
-			// Step, if specified, must be no greater than the target.
-			if start > target {
-				log.Warningf("start_offset %d cannot be greater than target_offset %d; adjusting it to be equal.", start, target)
-				start = target
-			}
-		} else {
-			start = target
-		}
+	if t.eyeSizeMode {
+		ln.testEyeSize(t, msg)
+	} else {
+		ln.scanEye(t, msg)
+	}
 
-		var step uint16
-		if t.spec.Step != nil {
-			step = uint16(t.spec.GetStep())
-			if step == 0 {
-				log.Warning("step cannot be 0; adjusting it to be 1.")
-				step = 1
-			}
-		} else {
-			step = 1
-		}
+	ln.outputEyeMeasurement(t)
+	return nil
+}
 
-		// eye scan mode is when the target_offset is not specified. Then ERROR_OUT is expected when the
-		// eye boundary is detected. Therefore, they are not reported as failure. Also, error_count==0
-		// are not reported to reduce cluttering.
-		ln.eyeScanMode = untilFail
-		// eye_size enables width and height checking, and also assumes the eye does not need to be
-		// centered. ERROR_OUT and BER checking are not enforced.
-		ln.eyeSizeCheck = t.spec.EyeSize != nil
-		// For eye size pass-fail testing, specify a range of steps (both starting_offset and
-		// target_offset), and also specify the eye_size in the test_spec. Then even the eye is off-
-		// center, the test can still pass.
+// setErrLimit sets up the test parameters like error limit and dwell time.
+func (ln *Lane) setErrLimit(t *aspect, msg *strings.Builder) error {
+	var cmd cmdRsp
+	cmd.rec = uint16(ln.rec)
+	cmd.usage = UsageModel
+	cmd.typ = MarginTypeSet
+	errlimit := uint16(t.spec.GetErrorLimit())
+	cmd.payload = SetErrorCountLimit | errlimit
+	if err := ln.lmrCmdRspEcho(&cmd); err != nil {
+		msg.WriteString(err.Error() + " | ")
+		return fmt.Errorf("failed to set error count limit: %w", err)
+	}
 
-		ln.statusVal = &ocppb.Validator{
-			Name: "Status Check",
-			Type: ocppb.Validator_IN_SET,
-		}
-		if ln.eyeScanMode || ln.eyeSizeCheck {
-			lv, _ := structpb.NewList([]any{
-				strings.TrimPrefix(lmtpb.LinkMargin_Lane_MarginPoint_S_MARGINING.String(), "S_"),
-				strings.TrimPrefix(lmtpb.LinkMargin_Lane_MarginPoint_S_ERROR_OUT.String(), "S_")})
-			ln.statusVal.Value = structpb.NewListValue(lv)
-		} else {
-			lv, _ := structpb.NewList([]any{
-				strings.TrimPrefix(lmtpb.LinkMargin_Lane_MarginPoint_S_MARGINING.String(), "S_")})
-			ln.statusVal.Value = structpb.NewListValue(lv)
-		}
+	return nil
+}
 
-		// BER threshold is calculated as the error_limit / (dwell_time * sample_rate).
-		// Additional 0.5 is added to the error_limit to avoid false failure
-		// when the actual error count is the same as the error_limit,
-		// while the berThresh is text-truncated in meltan artifact.
-		berThresh := (float64(errlimit) + 0.5) / (float64(*t.spec.Dwell) * sps)
-		ln.berVal = &ocppb.Validator{
-			Name:  "Max BER Check",
-			Type:  ocppb.Validator_LESS_THAN_OR_EQUAL,
-			Value: structpb.NewNumberValue(berThresh),
-		}
+// calculateDwellTime calculates the samples per second and updates the dwell time in the test spec.
+func (ln *Lane) calculateDwellTime(t *aspect) {
+	// Assumes max sampling rate if it reads 0, and independent error sampler is
+	// not supported or reporting method is count not rate.
+	if t.rate == 0 && (!ln.param.GetIndErrorSampler() || !ln.param.GetSampleReportingMethod()) {
+		t.rate = 63
+	}
+	// Calculates minimum dwell time based on bits to be sampled.
+	// Refers to PCIe 5.0 spec 8.4.4: SampleCount = 3*log 2 (number of bits)
+	t.bitCount = math.Pow(2.0, float64(t.spec.GetSamples())/3.0)
+	// Samples per second. t.rate is define as the # of bits checked out of 64 bits, - 1.
+	t.sps = (float64(t.rate+1) / 64.0) * ln.speed
+	// Expected dwell is bitCount / sps
+	t.dwell = time.Duration(t.bitCount / t.sps * float64(time.Second))
 
-		var mpPassPos, mpPassNeg, mpFailPos, mpFailNeg *lmtpb.LinkMargin_Lane_MarginPoint
-		for offset := start; ; {
-			// Steps until either target offset is reached or neither side is passing
-			passPos := false
-			passNeg := false
-			var mp *lmtpb.LinkMargin_Lane_MarginPoint
-			if mp, err = ln.margin(offset, t.VnotT, sps); err != nil {
-				msg.WriteString(err.Error() + " | ")
-			}
-			passPos = mp.GetStatus() == lmtpb.LinkMargin_Lane_MarginPoint_S_MARGINING
-			if passPos && mpFailPos == nil {
-				mpPassPos = mp
-			} else if mpFailPos == nil {
-				mpFailPos = mp
-			}
+	log.V(1).Infof("Lane %d: Sample bit count = %f, SPS = %f, Calculated dwell = %s",
+		ln.laneNumber, t.bitCount, t.sps, t.dwell)
 
-			passNeg = passPos
-			// if independent left/right or up/down, tests the negative side.
-			if t.indDir {
-				if mp, err = ln.margin(offset|t.dirmask, t.VnotT, sps); err != nil {
-					msg.WriteString(err.Error() + " | ")
-				}
-				passNeg = mp.GetStatus() == lmtpb.LinkMargin_Lane_MarginPoint_S_MARGINING
-			}
-			if passNeg && mpFailNeg == nil {
-				mpPassNeg = mp
-			} else if mpFailNeg == nil {
-				mpFailNeg = mp
-			}
+	// If greater dwell is specified, use that.
+	if t.spec.Dwell == nil || t.dwell > time.Duration(float64(*t.spec.Dwell)*float64(time.Second)) {
+		dwellSeconds := float32(t.dwell.Seconds())
+		t.spec.Dwell = &dwellSeconds
+		log.V(1).Infof("Lane %d: Using calculated dwell: %f seconds", ln.laneNumber, dwellSeconds)
+	} else {
+		log.V(1).Infof("Lane %d: Using specified dwell: %f seconds", ln.laneNumber, *t.spec.Dwell)
+	}
+}
 
-			if offset >= target {
-				break
-			} else if untilFail && !passPos && !passNeg {
-				break
-			} else {
-				offset += uint16(step)
-				// Makes sure target is margined in the end.
-				if offset > target {
-					offset = target
-				}
-			}
-		}
+// determineMarginRange sets the starting, target, and step for margining.
+func (ln *Lane) determineMarginRange(t *aspect) {
+	t.eyeSizeMode = false
+	t.targetMode = false
+	t.eyeScanMode = false
+	t.untilFail = false
+	t.errOutOK = false
+	t.target = 0
+	t.start = 0
+	t.step = 1
 
-		// Output the pass/fail boundary.
-		m := &ocppb.Measurement{
-			HardwareInfoId: ln.rx.hwinfo,
-		}
-		ln.mStepArti.Artifact = &ocppb.TestStepArtifact_Measurement{Measurement: m}
-		for i, mp := range []*lmtpb.LinkMargin_Lane_MarginPoint{
-			mpPassPos, mpFailPos, mpPassNeg, mpFailNeg} {
-			var dir string
-			var pf string
-			var unit string
-			var v float64
-			if mp != nil {
-				if i == 0 || i == 2 {
-					pf = "MAX-PASSING"
-				} else {
-					pf = "MIN-FAILING"
-				}
-				if t.VnotT {
-					if i == 0 || i == 1 {
-						dir = "TOP"
-					} else {
-						dir = "BOT"
-					}
-					v = float64(mp.GetVoltage())
-					unit = "V"
-				} else {
-					if i == 0 || i == 1 {
-						dir = "RIGHT"
-					} else {
-						dir = "LEFT"
-					}
-					v = float64(mp.GetPercentUi())
-					unit = "UI"
-				}
-				name := fmt.Sprintf("EYE CORNER %s %-5s", pf, dir)
-				mp.Info = &name
-				fmt.Println(ln.rx.hwinfo, ";LN=", ln.laneNumber, ";", name, ":", v, unit, ";Step=", mp.GetSteps())
-
-				if ln.eyeScanMode {
-					// Stream OCP TestStepMeasurement artifact
-					mName := fmt.Sprintf("LN=%02d;%s-%s-%s", ln.laneNumber, pf, unit, dir)
-					m.Name = mName
-					m.Unit = fmt.Sprintf("Unit=%s;BER=%.2E", unit, berThresh)
-					m.Value = structpb.NewNumberValue(v)
-					outputArtifact(ln.stepArtiOut)
-				}
-			}
-		}
-
-		if ln.eyeScanMode || ln.eyeSizeCheck {
-			v := float32(0.0)
-			if t.VnotT {
-				m.Name = fmt.Sprintf("LN=%02d;Eye-Height", ln.laneNumber)
-				m.Unit = fmt.Sprintf("Unit=V;BER=%.2E", berThresh)
-				if mpPassPos != nil {
-					v += mpPassPos.GetVoltage()
-				}
-				if mpPassNeg != nil {
-					v += mpPassNeg.GetVoltage()
-				}
-				ln.eyeHeight = float32(v)
-			} else {
-				m.Name = fmt.Sprintf("LN=%02d;Eye-Width", ln.laneNumber)
-				m.Unit = fmt.Sprintf("Unit=UI;BER=%.2E", berThresh)
-				if mpPassPos != nil {
-					v += mpPassPos.GetPercentUi()
-				}
-				if mpPassNeg != nil {
-					v += mpPassNeg.GetPercentUi()
-				}
-				ln.eyeWidth = float32(v)
-			}
-			m.Value = structpb.NewNumberValue(float64(v))
-			if ln.eyeSizeCheck {
-				if v < t.spec.GetEyeSize() {
-					ln.Pass = false
-				}
-				val := &ocppb.Validator{
-					Name:  "Eye Size Check",
-					Type:  ocppb.Validator_GREATER_THAN_OR_EQUAL,
-					Value: structpb.NewNumberValue(float64(t.spec.GetEyeSize())),
-				}
-				m.Validators = []*ocppb.Validator{val}
-			}
-			outputArtifact(ln.stepArtiOut)
+	if t.spec.Step != nil {
+		t.step = uint16(t.spec.GetStep())
+		if t.step == 0 {
+			log.Warningf("Lane %d: step cannot be 0, adjusting to 1", ln.laneNumber)
+			t.step = 1
 		}
 	}
 
-	// ln.lane != nil is an indication that the margining is done maturely.
-	ln.lane = new(lmtpb.LinkMargin_Lane)
+	startWithoutTarget := t.spec.TargetOffset == nil && t.spec.StartOffset != nil
+	targetSmallerThanEye := t.spec.TargetOffset == nil ||
+		(float32(t.spec.GetTargetOffset())*2.0*t.maxOffset < t.spec.GetEyeSize()*float32(t.steps))
 
-	return nil
+	// eyeSizeMode when the eye size is specified and is greater than the target offset if specified,
+	// except StartOffset without TargetOffset.
+	if t.spec.EyeSize != nil && !startWithoutTarget && targetSmallerThanEye {
+		t.eyeSizeMode = true
+		t.errOutOK = true
+		t.start = uint16(math.Ceil(float64(t.spec.GetEyeSize() / t.maxOffset * float32(t.steps))))
+		if t.spec.TargetOffset != nil {
+			t.target = uint16(t.spec.GetTargetOffset())
+		} else {
+			t.target = 0
+		}
+		log.V(1).Infof("Lane %d: EyeSizeMode: size=%d steps, target=%d, step=%d", ln.laneNumber, t.start, t.target, t.step)
+		return
+	}
+
+	if t.spec.TargetOffset != nil {
+		// Set the target max offset to be no greater than the Lane's capability.
+		if t.spec.GetTargetOffset() > t.steps {
+			log.Warningf("Lane %d: target_offset %d exceeds capability %d, adjusting", ln.laneNumber, *t.spec.TargetOffset, t.steps)
+			*t.spec.TargetOffset = t.steps
+		}
+		t.target = uint16(t.spec.GetTargetOffset())
+		t.targetMode = t.spec.StartOffset == nil
+	} else if t.spec.StartOffset != nil {
+		// Explore until fail mode
+		t.untilFail = true
+		t.target = uint16(t.steps)
+	}
+
+	if t.spec.StartOffset != nil {
+		t.eyeScanMode = true
+		t.errOutOK = true
+		t.start = uint16(*t.spec.StartOffset)
+		// Step, if specified, must be no greater than the target.
+		if t.start > t.target {
+			log.Warningf("Lane %d: start_offset %d > target_offset %d, adjusting start = target", ln.laneNumber, t.start, t.target)
+			t.start = t.target
+		}
+	} else {
+		t.start = t.target
+	}
+	log.V(1).Infof("Lane %d: Margin range: start=%d, target=%d, step=%d, untilFail=%v", ln.laneNumber, t.start, t.target, t.step, t.untilFail)
+}
+
+// setupLaneValidators sets up OCP validators for status and BER.
+func (ln *Lane) setupLaneValidators(t *aspect) {
+	ln.statusVal = &ocppb.Validator{
+		Name: "Status Check",
+		Type: ocppb.Validator_IN_SET,
+	}
+	var expectedStatus []any
+	if t.errOutOK {
+		expectedStatus = []any{
+			strings.TrimPrefix(lmtpb.LinkMargin_Lane_MarginPoint_S_MARGINING.String(), "S_"),
+			strings.TrimPrefix(lmtpb.LinkMargin_Lane_MarginPoint_S_ERROR_OUT.String(), "S_"),
+		}
+	} else {
+		expectedStatus = []any{
+			strings.TrimPrefix(lmtpb.LinkMargin_Lane_MarginPoint_S_MARGINING.String(), "S_"),
+		}
+	}
+	lv, _ := structpb.NewList(expectedStatus)
+	ln.statusVal.Value = structpb.NewListValue(lv)
+
+	// BER threshold is calculated as the error_limit / (dwell_time * sample_rate).
+	// Additional 0.5 is added to the error_limit to avoid false failure
+	// when the actual error count is the same as the error_limit,
+	// while the berThresh is text-truncated in meltan artifact.
+	errlimit := uint16(t.spec.GetErrorLimit())
+	t.berThresh = (float64(errlimit) + 0.5) / (float64(*t.spec.Dwell) * t.sps)
+	ln.berVal = &ocppb.Validator{
+		Name:  "Max BER Check",
+		Type:  ocppb.Validator_LESS_THAN_OR_EQUAL,
+		Value: structpb.NewNumberValue(t.berThresh),
+	}
+}
+
+// scanEye iterates through margin offsets to find the pass/fail boundaries.
+func (ln *Lane) scanEye(t *aspect, msg *strings.Builder) {
+	var err error
+	for offset := t.start; ; {
+		// Steps until either target offset is reached or neither side is passing
+		passPos := false
+		passNeg := false
+		var mp *lmtpb.LinkMargin_Lane_MarginPoint
+
+		// If independent error sampler is not supported and the positive offset is already failed, stop
+		// margining the positive offset, because too many errors may break the link.
+		if ln.param.IndErrorSampler || t.mp[pos][fail] == nil {
+			if mp, err = ln.margin(offset, t); err != nil {
+				msg.WriteString(err.Error() + " | ")
+			}
+
+			passPos = mp.GetStatus() == lmtpb.LinkMargin_Lane_MarginPoint_S_MARGINING
+			if passPos {
+				if t.mp[pos][fail] == nil { // if not yet found a fail point, store the pass point
+					t.mp[pos][pass] = mp
+				}
+			} else {
+				if t.mp[pos][fail] == nil {
+					t.mp[pos][fail] = mp
+				}
+			}
+		}
+
+		passNeg = passPos
+		// if independent left/right or up/down, tests the negative side.
+		if t.indDir {
+			// If independent error sampler is not supported and the negative offset is already failed, stop
+			// margining the negative offset, because too many errors may break the link.
+			if ln.param.IndErrorSampler || t.mp[neg][fail] == nil {
+
+				if mp, err = ln.margin(offset|t.dirmask, t); err != nil {
+					msg.WriteString(err.Error() + " | ")
+				}
+
+				passNeg = mp.GetStatus() == lmtpb.LinkMargin_Lane_MarginPoint_S_MARGINING
+			}
+		}
+		if passNeg {
+			if t.mp[neg][fail] == nil { // if not yet found a fail point, store the pass point
+				t.mp[neg][pass] = mp
+			}
+		} else {
+			if t.mp[neg][fail] == nil {
+				t.mp[neg][fail] = mp
+			}
+		}
+
+		if offset >= t.target {
+			break
+		} else if t.untilFail && !passPos && !passNeg {
+			break
+		} else {
+			offset += uint16(t.step)
+			// Makes sure target is margined in the end.
+			if offset > t.target {
+				offset = t.target
+			}
+		}
+	}
+}
+
+// testEyeSize checks if the eye size meets the spec even if it's off-centered.
+func (ln *Lane) testEyeSize(t *aspect, msg *strings.Builder) {
+	var err error
+
+	passPos := false
+	passNeg := false
+
+	var mp *lmtpb.LinkMargin_Lane_MarginPoint
+	offset := t.start / 2 // Under the checkEyeSize mode, start is the required eye size in steps.
+
+RedoPos: // Redo the positive offset if the eye center is more positive.
+	for offset = t.start - offset; ; { // Start from positive half of the eye size rounding up.
+		// margin at offset downwards towards the positive target, or if passing.
+		if mp, err = ln.margin(offset, t); err != nil {
+			msg.WriteString(err.Error() + " | ")
+		}
+		passPos = mp.GetStatus() == lmtpb.LinkMargin_Lane_MarginPoint_S_MARGINING
+
+		// If independent left/right or up/down not supported, the test is done, as no off-centeredness.
+		if !t.indDir {
+			passNeg = passPos
+			if passPos {
+				t.mp[pos][pass] = mp
+				t.mp[neg][pass] = mp
+			} else {
+				t.mp[pos][fail] = mp
+				t.mp[neg][fail] = mp
+			}
+			return
+		}
+
+		if passPos {
+			t.mp[pos][pass] = mp
+			break // move to the negative half if the positive passing offset is found.
+		}
+
+		t.mp[pos][fail] = mp // record the smallest failing offset.
+
+		if offset <= t.target {
+			break // when all failing, end the scan at the target offset.
+		}
+		offset -= uint16(t.step)
+		if offset < t.target {
+			offset = t.target // when all failing, always test the target offset.
+		}
+	}
+
+	if passNeg { // Only when RedoPos, passNeg is true.
+		return
+	}
+
+	// Even when the positive target fails, still get some measurement on the negative side, even
+	// though the eye size check already failed.
+	for offset = t.start - offset; ; { // Start from eye_size - positive passing offset.
+		// margin at negative offset upwards towards the negative target, or if passing.
+		if mp, err = ln.margin(offset|t.dirmask, t); err != nil {
+			msg.WriteString(err.Error() + " | ")
+		}
+		passNeg = mp.GetStatus() == lmtpb.LinkMargin_Lane_MarginPoint_S_MARGINING
+
+		if passNeg {
+			t.mp[neg][pass] = mp
+			break
+		}
+
+		t.mp[neg][fail] = mp // record the smallest failing offset.
+
+		if offset <= t.target {
+			break // when all failing, end the scan at the target offset.
+		}
+		offset -= uint16(t.step)
+		if offset < t.target {
+			offset = t.target // when all failing, always test the target offset.
+		}
+	}
+
+	// If positive scan never fails, and the negative scan is smaller the eye_size/2,
+	// the eye center may be more positive. Redo the positive scan starting from bigger offset.
+	if passPos && passNeg && t.mp[pos][fail] == nil && t.mp[neg][fail] != nil {
+		goto RedoPos
+	}
+}
+
+// outputEyeMeasurement processes margin results, printing to console and generating OCP artifacts.
+func (ln *Lane) outputEyeMeasurement(t *aspect) {
+	m := &ocppb.Measurement{HardwareInfoId: ln.rx.hwinfo}
+	ln.mStepArti.Artifact = &ocppb.TestStepArtifact_Measurement{Measurement: m}
+
+	vt := 1
+	if t.VnotT {
+		vt = 0
+	}
+
+	MeasDir := [2][2]string{
+		{"TOP", "BOT"},
+		{"RIGHT", "LEFT"},
+	}
+	MeasUnit := [2]string{"V", "UI"}
+	MeasPF := [2]string{"MAX-PASSING", "MIN-FAILING"}
+
+	for pn := pos; pn <= neg; pn++ { // 0: Pos, 1: Neg
+		for pf := pass; pf <= fail; pf++ {
+			mp := t.mp[pn][pf]
+			if mp == nil {
+				continue
+			}
+
+			name := fmt.Sprintf("EYE CORNER %s %-5s", MeasPF[pf], MeasDir[vt][pn])
+			mp.Info = &name
+
+			var value float64
+			if t.VnotT {
+				value = float64(mp.GetVoltage())
+			} else {
+				value = float64(mp.GetPercentUi())
+			}
+			fmt.Println(ln.rx.hwinfo, ";LN=", ln.laneNumber, ";", name, ":", value, MeasUnit[vt], ";Step=", mp.GetSteps())
+
+			if t.eyeScanMode {
+				m.Name = fmt.Sprintf("LN=%02d;%s-%s-%s", ln.laneNumber, MeasPF[pf], MeasUnit[vt], MeasDir[vt][pn])
+				m.Unit = fmt.Sprintf("Unit=%s;BER=%.2E", MeasUnit[vt], t.berThresh)
+				m.Value = structpb.NewNumberValue(value)
+				m.Validators = nil // Clear validators from any previous artifact.
+				outputArtifact(ln.stepArtiOut)
+			}
+		}
+	}
+
+	if t.eyeScanMode || t.eyeSizeMode {
+		ln.outputEyeSizeArtifact(m, t)
+	}
+}
+
+// outputEyeSizeArtifact streams an OCP artifact for the total eye width or height.
+func (ln *Lane) outputEyeSizeArtifact(m *ocppb.Measurement, t *aspect) {
+	var totalSize float32
+	if t.VnotT {
+		m.Name = fmt.Sprintf("LN=%02d;Eye-Height", ln.laneNumber)
+		m.Unit = fmt.Sprintf("Unit=V;BER=%.2E", t.berThresh)
+		if t.mp[pos][pass] != nil {
+			totalSize += t.mp[pos][pass].GetVoltage()
+		}
+		if t.mp[neg][pass] != nil {
+			totalSize += t.mp[neg][pass].GetVoltage()
+		}
+		ln.eyeHeight = totalSize
+	} else {
+		m.Name = fmt.Sprintf("LN=%02d;Eye-Width", ln.laneNumber)
+		m.Unit = fmt.Sprintf("Unit=UI;BER=%.2E", t.berThresh)
+		if t.mp[pos][pass] != nil {
+			totalSize += t.mp[pos][pass].GetPercentUi()
+		}
+		if t.mp[neg][pass] != nil {
+			totalSize += t.mp[neg][pass].GetPercentUi()
+		}
+		ln.eyeWidth = totalSize
+	}
+
+	m.Value = structpb.NewNumberValue(float64(totalSize))
+	if t.spec.EyeSize != nil {
+		if totalSize < t.spec.GetEyeSize() {
+			ln.Pass = false
+		}
+		m.Validators = []*ocppb.Validator{{
+			Name:  "Eye Size Check",
+			Type:  ocppb.Validator_GREATER_THAN_OR_EQUAL,
+			Value: structpb.NewNumberValue(float64(t.spec.GetEyeSize())),
+		}}
+	} else {
+		m.Validators = nil
+	}
+	outputArtifact(ln.stepArtiOut)
 }

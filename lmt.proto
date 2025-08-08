@@ -81,24 +81,27 @@ message LinkMargin {
     optional float dwell = 4;  // min number of seconds per margining.
     uint32 error_limit = 5;    // 0 to 63 max error allowed
 
-    // Bring-up and IST use cases are different:
-    // In IST, the start_offset and step are not specified. The passing
-    // condition is that the number of errors should be no greater than the
-    // error_limit when both samples and dwell are reached at the target_steps.
-    // In Bring-up, ultiple margining points are tested, by stepping from
-    // start_offset to the first failing point, or the target_offset if
-    // specified.
-    optional uint32 start_offset = 6;  // The starting offset in steps.
+    // Use Case 1: eye exploration, especially on a unkonwn new link.
+    // From the start_offset, step outwards until either ERROR_OUT is seen or
+    // the target_offset, when specified, is reached. Checking the eye_size,
+    // if specified, is secondary.
+    // Use Case 2: Target offset check, for quick pass/fail testing.
+    // Only the target_offset is specified. The start_offset is not specified.
+    // The eye_size and step are ignored.
+    // Use Case 3: Eye size check, for quick off-centered eye size testing.
+    // The eye_size is specified. The start_offset is not specified.
+    // The target_offset, if specified, must be smaller than the eye_size / 2.
+    // It specifies the max allowable off-centeredness. The step specifies how
+    // much to shift the eye every time.
+    optional uint32 start_offset = 6;
     optional uint32 step = 7;
-    optional uint32 target_offset = 8;  // The final offset (in steps) to margin
+    optional uint32 target_offset = 8;
+    optional float eye_size = 10;
 
     // By default, all lanes on a port are tested.
     // For bring-up use case, margining can be tested only on a single lane.
     // However, the same lane_number must be specified on both tspec and vspec.
     repeated uint32 lane_number = 9;  // If specified, only test listed lanes.
-    // If the eye_size is specified, check the eye width (UI) or height (V), the
-    // difference between the max passing offsets in the opposit directions.
-    optional float eye_size = 10;
   }
 
   // Use a list of receiver_lanes to support retimers (preferred).
