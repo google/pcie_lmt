@@ -31,6 +31,7 @@ import (
 	"sync"
 
 	log "github.com/golang/glog"
+	structpb "google.golang.org/protobuf/types/known/structpb"
 	"google.golang.org/protobuf/proto"
 	ocppb "ocpdiag/results_go_proto"
 	lmtpb "lmt_go.proto"
@@ -143,6 +144,7 @@ func (lt *linktest) marginLink() {
 	// Tests upstream lanes in parallel, followed by downstream lanes in parallel,
 	// with wait in between to avoid pcilib sysfs error
 	var wg sync.WaitGroup
+	linkcheck := true
 	for _, r := range lt.allRx {
 		if r == nil {
 			continue
@@ -150,6 +152,9 @@ func (lt *linktest) marginLink() {
 		if !r.testReady {
 			continue
 		} // Skips receivers not tested
+		if !linkcheck {
+			continue
+		} // skip the rest of RX if link is no good.
 		log.V(1).Infoln("Margining lanes at receiver: ", r.rec.String())
 
 		// OCP TestStepStart
@@ -198,11 +203,72 @@ func (lt *linktest) marginLink() {
 			}
 		}
 
+		// Checks if the link is still at the same width and speed.
+		addr := r.port.pcieCapOffset + C.PCI_EXP_LNKSTA
+		val := pci.ReadWord(r.port.dev, addr)
+		width := uint32((val & C.PCI_EXP_LNKSTA_WIDTH) >> LinkStatusWidthPos)
+		gen := uint32(val & C.PCI_EXP_LNKSTA_SPEED)
+
+		if width != r.port.width || gen != r.port.gen {
+			linkcheck = false
+			message := fmt.Sprintf("Link width/speed changed from gen%dx%d to gen%dx%d.",
+				r.port.gen, r.port.width, gen, width)
+			log.Errorf("%s Post margin at %s, %s", r.port.dev.BDFString(), r.rec.String(), message)
+
+			fullMessage := lt.pb.GetMessage() + message + " | "
+			lt.pb.Message = &fullMessage
+		}
+
+		validator := &ocppb.Validator{
+			Name:  "Link Width Check",
+			Type:  ocppb.Validator_EQUAL,
+			Value: structpb.NewNumberValue(float64(r.port.width)),
+		}
+		m := &ocppb.Measurement{
+			Name:           fmt.Sprintf("width-%s", r.port.dev.BDFString()),
+			Value:          structpb.NewNumberValue(float64(width)),
+			HardwareInfoId: r.hwinfo,
+			Validators:     []*ocppb.Validator{validator},
+		}
+		stepArti = &ocppb.TestStepArtifact{
+			Artifact:   &ocppb.TestStepArtifact_Measurement{Measurement: m},
+			TestStepId: r.hwinfo,
+		}
+		outArti = &ocppb.OutputArtifact{
+			Artifact: &ocppb.OutputArtifact_TestStepArtifact{stepArti},
+		}
+		outputArtifact(outArti)
+
+		validator = &ocppb.Validator{
+			Name:  "Link Speed Check",
+			Type:  ocppb.Validator_EQUAL,
+			Value: structpb.NewNumberValue(float64(r.port.gen)),
+		}
+		m = &ocppb.Measurement{
+			Name:           fmt.Sprintf("speed-%s", r.port.dev.BDFString()),
+			Value:          structpb.NewNumberValue(float64(gen)),
+			HardwareInfoId: r.hwinfo,
+			Validators:     []*ocppb.Validator{validator},
+		}
+		stepArti = &ocppb.TestStepArtifact{
+			Artifact:   &ocppb.TestStepArtifact_Measurement{Measurement: m},
+			TestStepId: r.hwinfo,
+		}
+		outArti = &ocppb.OutputArtifact{
+			Artifact: &ocppb.OutputArtifact_TestStepArtifact{stepArti},
+		}
+		outputArtifact(outArti)
+
 		diag := &ocppb.Diagnosis{
 			Type:           ocppb.Diagnosis_UNKNOWN,
 			HardwareInfoId: r.hwinfo,
 		}
-		if lncnt == 0 {
+		if !linkcheck {
+			diag.Type = ocppb.Diagnosis_FAIL
+			diag.Verdict = "pcie_lmt-rx_ln-fail"
+			diag.Message = fmt.Sprintf("Link width/speed changed from gen%dx%d to gen%dx%d.",
+				r.port.gen, r.port.width, gen, width)
+		} else if lncnt == 0 {
 			diag.Verdict = "pcie_lmt-rx_ln-unknown"
 			diag.Message = "0 Rx-lane tested."
 		} else if failcnt == 0 {

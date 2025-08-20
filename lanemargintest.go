@@ -76,6 +76,7 @@ type port struct {
 	dev           pci.Dev // PCI config access for the port.
 	isUSP         bool
 	width         uint32
+	gen           uint32
 	pcieCapOffset int32 // PCI EXP CAPABILITIES offset
 	lmrAddr       int32 // LMR capability address
 	testReady     bool  // The port is capable of LMR testing.
@@ -468,17 +469,17 @@ func getLinks(devs pci.Dev, cfg *lmtpb.LinkMargin) ([]*linktest, error) {
 					addr := p.pcieCapOffset + C.PCI_EXP_LNKSTA
 					val := pci.ReadWord(p.dev, addr)
 					p.width = uint32((val & C.PCI_EXP_LNKSTA_WIDTH) >> LinkStatusWidthPos)
-					speed := pci.ReadWord(p.dev, addr) & C.PCI_EXP_LNKSTA_SPEED
+					p.gen = uint32(val & C.PCI_EXP_LNKSTA_SPEED)
 					msg.WriteString(fmt.Sprintf(
 						"Info: %s: PCIEXP CAP offset=%x; PCI_EXP_LNKSTA_WIDTH=%d; PCI_EXP_LNKSTA_SPEED=%d  | ",
-						bdf, p.pcieCapOffset, p.width, speed))
-					switch speed {
+						bdf, p.pcieCapOffset, p.width, p.gen))
+					switch p.gen {
 					case Speed16G:
 						p.speed = 16.0e9
 					case Speed32G:
 						p.speed = 32.0e9
 					default:
-						log.V(1).Infoln(bdf, " speed %d is not gen4 nor gen5. Skipped.", speed)
+						log.V(1).Infoln(bdf, " speed %d is not gen4 nor gen5. Skipped.", p.gen)
 						p.speed = 0.0
 						p.testReady = false
 						lt.testReady = false

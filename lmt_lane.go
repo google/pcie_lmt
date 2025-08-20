@@ -513,9 +513,9 @@ func (ln *Lane) scanEye(t *aspect, msg *strings.Builder) {
 		passNeg := false
 		var mp *lmtpb.LinkMargin_Lane_MarginPoint
 
-		// If independent error sampler is not supported and the positive offset is already failed, stop
-		// margining the positive offset, because too many errors may break the link.
-		if ln.param.IndErrorSampler || t.mp[pos][fail] == nil {
+		// Too many errors causes link recoveries, so stop further offsets once failed.
+		// Theoretically, IndErrorSampler avoids it. However, it's not true on some retimer devices.
+		if t.mp[pos][fail] == nil {
 			if mp, err = ln.margin(offset, t); err != nil {
 				msg.WriteString(err.Error() + " | ")
 			}
@@ -535,9 +535,9 @@ func (ln *Lane) scanEye(t *aspect, msg *strings.Builder) {
 		passNeg = passPos
 		// if independent left/right or up/down, tests the negative side.
 		if t.indDir {
-			// If independent error sampler is not supported and the negative offset is already failed, stop
-			// margining the negative offset, because too many errors may break the link.
-			if ln.param.IndErrorSampler || t.mp[neg][fail] == nil {
+			// Too many errors causes link recoveries, so stop further offsets once failed.
+			// Theoretically, IndErrorSampler avoids it. However, it's not true on some retimer devices.
+			if t.mp[neg][fail] == nil {
 
 				if mp, err = ln.margin(offset|t.dirmask, t); err != nil {
 					msg.WriteString(err.Error() + " | ")
