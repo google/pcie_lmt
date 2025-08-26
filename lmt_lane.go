@@ -400,6 +400,7 @@ func (ln *Lane) calculateDwellTime(t *aspect) {
 		t.spec.Dwell = &dwellSeconds
 		log.V(1).Infof("Lane %d: Using calculated dwell: %f seconds", ln.laneNumber, dwellSeconds)
 	} else {
+		t.dwell = time.Duration(float64(*t.spec.Dwell) * float64(time.Second))
 		log.V(1).Infof("Lane %d: Using specified dwell: %f seconds", ln.laneNumber, *t.spec.Dwell)
 	}
 }
