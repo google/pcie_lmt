@@ -49,7 +49,8 @@ var (
 	specJSON = flag.String("spec_json", "", "The test spec .json file.")
 	result   = flag.String("result", "result.pbtxt", "The result pbtxt file name.")
 	csv      = flag.String("csv", "", "Dumps a csv file for plotting.")
-	pb2csv   = flag.Bool("result2csv", false, "Converts the [result] to a [csv] file for plotting.")
+	resultToCSV   = flag.Bool("result_to_csv", false, "[Deprecated] Converts the [result] to a [csv] file for plotting.")
+	resultToHTML  = flag.Bool("result_to_html", false, "Converts the [result] to a [.html] test report with plotting.")
 	ocpPipe  = flag.String("ocp_pipe", "/dev/null", "Named pipe or file to stream the OCP Artifacts.")
 )
 
@@ -63,12 +64,23 @@ func main() {
 		os.Exit(0)
 	}
 
-	if *pb2csv {
+	if *resultToCSV {
 		if *csv == "" || *result == "" {
-			log.Exit("Error: With -result2csv, both -result and -csv must be specified.")
+			log.Exit("Error: With -result_to_csv, both -result and -csv must be specified.")
 		}
 		lmt.ReadResult(*result)
 		lmt.ConvertToCsv(*csv)
+
+		os.Exit(0)
+	}
+
+	if *resultToHTML {
+		if *result == "" {
+			log.Exit("Error: With -result_to_html, -result must be specified.")
+		}
+		lmt.ReadResult(*result)
+		htmlfn := strings.TrimSuffix(*result, filepath.Ext(*result)) + ".html"
+		lmt.ConvertToHTML(htmlfn)
 
 		os.Exit(0)
 	}
@@ -117,7 +129,7 @@ func main() {
 				if bus, err := strconv.ParseUint(busstr, 0, 32); err != nil {
 					log.Error(busstr, " is not a valid bus number format.")
 				} else {
-					cfg.Bdf = append(cfg.GetBdf(), fmt.Sprintf("%04x:%02x:%02x.%d", 0, bus, 0, 0) )
+					cfg.Bdf = append(cfg.GetBdf(), fmt.Sprintf("%04x:%02x:%02x.%d", 0, bus, 0, 0))
 				}
 			}
 		}
@@ -181,6 +193,9 @@ func main() {
 	if err := lmt.WriteResultPbtxt(*result); err != nil {
 		log.Exit(err)
 	}
+	htmlfn := strings.TrimSuffix(*result, filepath.Ext(*result)) + ".html"
+	lmt.ConvertToHTML(htmlfn)
+
 	if *csv != "" {
 		lmt.ConvertToCsv(*csv)
 	}

@@ -16,6 +16,7 @@ test explores the error rate both timing-wise and voltage-wise. Here's a
 - Supports retimer receivers
 - Works with or without independent-error-sampler
 - Supports both sample count and sample rate reporting methods
+- HTML test report with margin plot.
 
 ### Performance:
 - Lane-parallel-margining for speed when independent-error-sampler presents
@@ -29,7 +30,6 @@ test explores the error rate both timing-wise and voltage-wise. Here's a
 - [OCP-Diag](https://github.com/opencomputeproject/ocp-diag-core/tree/main/json_spec) compliant artifact streaming
 - Supports both x86 and ARM
 - Linux-only: LMT uses the pciutils lib, which is behind the lspci and setpci tools.
-- Colorful plotting in Google Sheet
 
 A [lmt.proto](lmt.proto) specifies all aspects of the test, as well as logging the test result. The
 top-level proto message specifies the PCIe link(s) to test. Each receiver point
@@ -38,8 +38,8 @@ spec. For production testing, the test spec sets a target offset, a sample count
 (or in terms of a minimum dwell time), and an error limit. The margining passes
 if the error count is within the limit after checking the specified number of
 bits at the timing/voltage offset. In characterization usage, the test steps
-through incremental offsets and records the error rates. A companion flow plots
-the error rates in a Google Sheets.
+through incremental offsets and records the error rates. The test generates a
+result.html graphical test report along with the result.pbtxt raw test data.
 
 <img src="lmt_plot_screenshot.png" align="center" />
 
@@ -63,34 +63,33 @@ Version: 1.0 : Not user friendly yet, but useful to those who understand it.
 
 ## Build and Run Commands:
 ```
-# Not yet ported to the bzlmod required by bazel v8.0.1
-# So build with v7.5.0 by using bazelisk
-sudo npm install -g @bazel/bazelisk
+bazel build -c opt :lmt
 
-USE_BAZEL_VERSION=7.5.0 bazelisk build -c opt :lmt
+bazel build //:lmt --define pci_link=dynamic
 
-USE_BAZEL_VERSION=7.5.0 bazelisk build -c opt :lmt \
+export USE_BAZEL_VERSION=7.5.0
+bazel build -c opt :lmt \
   --platforms=@io_bazel_rules_go//go/toolchain:linux_arm64_cgo  # ARM support
 
-USE_BAZEL_VERSION=7.5.0 bazelisk run -c opt :lmt -- -h
 
 bazel-bin/lmt_/lmt \
   -alsologtostderr -v=0 \
   -spec=dut_lmt_spec.pbtxt \
   -result=dut_lmt_result.pbtxt \
-  -csv=dut_lmt_result.csv \
   -ocp_pipe=dut_lmt_ocp.json \
   -vendor_id=0x1000 -device_id=0xC030 \
   -bus=0x81,0xa1,0x63
-
-bazel-bin/lmt_/lmt \
-  -result2csv=dut_lmt_result.pbtxt \
-  -csv=dut_lmt_result.csv
 ```
 
-To plot the result in Google Sheets, make a copy of this [Google Sheet](https://docs.google.com/spreadsheets/d/1wdW-EsGtoSaoPytttZcERPhuQAR9PL04kxA6xuGm-hk)
-Then import the dut_lmt_result.csv as a new sheet. Click the menu button `LMT
-Plot` -> `Create Gradient Charts` to plot the charts.
+## Bazel Compatibility
+
+This project defaults to **Bazel 7.5.0** (via `USE_BAZEL_VERSION` in test scripts) to support ARM cross-compilation out of the box.
+
+If you wish to use **Bazel 9+**:
+1. Open `MODULE.bazel`.
+2. Comment out the `toolchains_arm_gnu` dependency and registration (the "ARM cross compilation toolchains" section) due to incompatibility.
+3. You will be able to build for x86 using Bazel 9+, but ARM cross-compilation will be disabled.
+
 
 ## Test Spec and Result Examples
 Refer to [lmt.proto](lmt.proto).

@@ -13,6 +13,7 @@
 # limitations under the License.
 
 load("@bazel_skylib//rules:write_file.bzl", "write_file")
+load("@rules_cc//cc:defs.bzl", "cc_library")
 
 genrule(
     name = "gen_pci_pci_h",
@@ -51,40 +52,42 @@ write_file(
     ],
 )
 
-cc_library(
-    name = "libpci",
+filegroup(
+    name = "pciutils_static_srcs",
     srcs = [
         "lib/access.c",
         "lib/caps.c",
         "lib/dump.c",
         "lib/filter.c",
         "lib/generic.c",
-        "lib/header.h",
         "lib/init.c",
-        "lib/internal.h",
         "lib/names.c",
-        "lib/names.h",
         "lib/names-cache.c",
         "lib/names-hash.c",
         "lib/names-hwdb.c",
         "lib/names-net.c",
         "lib/names-parse.c",
         "lib/params.c",
-        "lib/pci.h",
-        "lib/pread.h",
         "lib/proc.c",
-        "lib/sysdep.h",
         "lib/sysfs.c",
-        "lib/types.h",
-        ":lib/config.h",
     ] + select({
         "@platforms//cpu:x86_64": [
-            "lib/i386-io-linux.h",
             "lib/i386-ports.c",
         ],
         "//conditions:default": [],
     }),
-    hdrs = ["pci/pci.h"],
+)
+
+cc_library(
+    name = "libpci",
+    srcs = select({
+        "@//:dynamic_libpci": [],
+        "//conditions:default": [":pciutils_static_srcs"],
+    }),
+    hdrs = [
+        ":lib/config.h",
+        ":pci/pci.h",
+    ] + glob(["lib/*.h"]),
     copts = [
         "-Wno-error",
         "-w",
@@ -94,6 +97,13 @@ cc_library(
         ".",
         "lib",
     ],
+    linkopts = select({
+        "@//:dynamic_libpci": ["-l:libpci.so.3"],
+        "//conditions:default": [],
+    }),
     visibility = ["//visibility:public"],
-    deps = ["@zlib"],
+    deps = select({
+        "@//:dynamic_libpci": [],
+        "//conditions:default": ["@zlib"],
+    }),
 )

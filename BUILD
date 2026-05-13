@@ -20,6 +20,12 @@ load("@rules_proto//proto:defs.bzl", "proto_library")
 # gazelle:prefix local/pcie_lmt
 gazelle(name = "gazelle")
 
+config_setting(
+    name = "dynamic_libpci",
+    define_values = {"pci_link": "dynamic"},
+    visibility = ["//visibility:public"],
+)
+
 proto_library(
     name = "lmt_proto",
     srcs = ["lmt.proto"],
@@ -41,6 +47,7 @@ go_library(
         "lmt_link.go",
         "lmt_offset.go",
         "lmt_result2csv.go",
+        "lmt_result2html.go",
         "lmt_tally.go",
     ],
     cdeps = [
@@ -61,7 +68,9 @@ go_library(
     ],
 )
 
+# USE_BAZEL_VERSION=7.5.0 bazelisk \
 # bazel build //:lmt \
+#   --define pci_link=dynamic \
 #   --platforms=@io_bazel_rules_go//go/toolchain:linux_arm64_cgo
 go_binary(
     name = "lmt",
@@ -86,7 +95,10 @@ go_library(
         "@pciutils//:libpci",
     ],
     cgo = 1,
-    clinkopts = ["-static"],
+    clinkopts = select({
+        "@//:dynamic_libpci": [],
+        "//conditions:default": ["-static"],
+    }),
     importpath = "pciutils",
     visibility = ["//visibility:public"],
     deps = [

@@ -16,13 +16,23 @@
 # protobuf and struct representations.
 
 load("@io_bazel_rules_go//proto:def.bzl", "go_proto_library")
+load("@rules_proto//proto:defs.bzl", "proto_library")
 
 licenses(["notice"])
 
 package(default_visibility = ["//visibility:public"])
 
+proto_library(
+    name = "results_proto_alias",
+    srcs = ["ocpdiag/core/results/data_model/results.proto"],
+    deps = [
+        "@com_google_protobuf//:struct_proto",
+        "@com_google_protobuf//:timestamp_proto",
+    ],
+)
+
 go_proto_library(
     name = "results_go_proto",
     importpath = "ocpdiag/results_go_proto",
-    proto = "@ocpdiag//ocpdiag/core/results/data_model:results_proto",
+    proto = ":results_proto_alias",
 )

@@ -55,7 +55,9 @@ go_library(
     ],
 )
 
+# USE_BAZEL_VERSION=7.5.0 bazelisk \
 # bazel build //:ltt \
+#   --define pci_link=dynamic \
 #   --platforms=@io_bazel_rules_go//go/toolchain:linux_arm64_cgo
 go_binary(
     name = "ltt",

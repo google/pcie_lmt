@@ -1,20 +1,60 @@
-###############################################################################
-# Bazel now uses Bzlmod by default to manage external dependencies.
-# Please consider migrating your external dependencies from WORKSPACE to MODULE.bazel.
+# Copyright 2023 Google LLC
 #
-# For more details, please check https://github.com/bazelbuild/bazel/issues/18958
-###############################################################################
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 module(
     name = "pcie_lmt",
     version = "0.1.0",
-    compatibility_level = 1,
 )
 
-"""ARM cross compilation toolchains for bazel"""
-bazel_dep(name = "toolchains_arm_gnu", version = "1.0.1")
+# ARM cross compilation toolchains for bazel
+# NOTE: toolchains_arm_gnu@1.1.0 is incompatible with Bazel 9+.
+# To use Bazel 9+, comment out the blocks below until "register_toolchains".
+bazel_dep(name = "toolchains_arm_gnu", version = "1.1.0")
 
 arm_toolchain = use_extension("@toolchains_arm_gnu//:extensions.bzl", "arm_toolchain")
-
 arm_toolchain.aarch64_none_linux_gnu()
 use_repo(arm_toolchain, "aarch64_none_linux_gnu")
+
 register_toolchains("@aarch64_none_linux_gnu//toolchain:all")
+
+# Go rules and Gazelle
+bazel_dep(name = "rules_go", version = "0.59.0", repo_name = "io_bazel_rules_go")
+bazel_dep(name = "gazelle", version = "0.47.0", repo_name = "bazel_gazelle")
+
+# Protobuf
+bazel_dep(name = "protobuf", version = "33.4", repo_name = "com_google_protobuf")
+bazel_dep(name = "rules_proto", version = "7.1.0")
+bazel_dep(name = "bazel_skylib", version = "1.8.2")
+bazel_dep(name = "rules_cc", version = "0.2.17")
+bazel_dep(name = "platforms", version = "0.0.10")
+
+# Go Dependencies via Gazelle
+go_deps = use_extension("@bazel_gazelle//:extensions.bzl", "go_deps")
+go_deps.module(
+    path = "github.com/golang/glog",
+    sum = "h1:uCdmnmatrKCgMBlM4rMuJZWOkPDqdbZPnrMXDY4gI68=",
+    version = "v1.2.0",
+)
+use_repo(go_deps, "com_github_golang_glog")
+
+go_deps.module(
+    path = "google.golang.org/protobuf",
+    sum = "h1:g0LwbHXjfflytmUgFgat1xm6cbqu16dca1ff07e3WwU=",
+    version = "v1.31.0",
+)
+use_repo(go_deps, "org_golang_google_protobuf")
+
+# Non-module dependencies
+non_module = use_extension("//:extensions.bzl", "non_module_deps")
+use_repo(non_module, "ocpdiag", "pciutils", "zlib")

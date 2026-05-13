@@ -174,7 +174,7 @@ func ReadLinkMargin(fn string, isJSON bool) (*lmtpb.LinkMargin, error) {
 	return cfg, nil
 }
 
-//  bdfToUnit32 converts a BDF string to a uint32 for comparing.
+// bdfToUnit32 converts a BDF string to a uint32 for comparing.
 func bdf2u32(bdf string) uint32 {
 	domain := uint16(0)
 	b := uint8(0)
@@ -478,8 +478,10 @@ func getLinks(devs pci.Dev, cfg *lmtpb.LinkMargin) ([]*linktest, error) {
 						p.speed = 16.0e9
 					case Speed32G:
 						p.speed = 32.0e9
+					case Speed64G:
+						p.speed = 64.0e9
 					default:
-						log.V(1).Infoln(bdf, " speed %d is not gen4 nor gen5. Skipped.", p.gen)
+						log.V(1).Infoln(bdf, " speed %d is not above gen4. Skipped.", p.gen)
 						p.speed = 0.0
 						p.testReady = false
 						lt.testReady = false
@@ -489,7 +491,8 @@ func getLinks(devs pci.Dev, cfg *lmtpb.LinkMargin) ([]*linktest, error) {
 				if p.lmrAddr, err = p.getLMRcapability(); err != nil {
 					p.testReady = false
 					// The LMR is required at gen4 and above. If it's not found, it's like not a real link.
-					lt.testReady = false
+					// However, currently CX8 does not have LMR capability. We still want to margin the DSP.
+					// lt.testReady = false
 					msg.WriteString(fmt.Sprintf("Error: %s: %s | ", bdf, err.Error()))
 				} else {
 					msg.WriteString(fmt.Sprintf("Info: %s: LMR CAP offset=%x | ", bdf, p.lmrAddr))

@@ -84,6 +84,8 @@ const (
 	Speed16G = 4
 	// Speed32G is Gen5 speed encoding.
 	Speed32G = 5
+	// Speed64G is Gen6 speed encoding.
+	Speed64G = 6
 	// LinkStatusWidthPos is from the PCIe config space register definition.
 	LinkStatusWidthPos = 4
 	// USP, DSP, and max 2 retimers with 2 Rx each.
