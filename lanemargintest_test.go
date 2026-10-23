@@ -334,8 +334,17 @@ func TestValidateLinkTarget(t *testing.T) {
 		target  *lmtpb.PcieLinkTarget
 		wantErr bool
 	}{
-		{name: "nil target", target: nil},
-		{name: "no bdfs", target: &lmtpb.PcieLinkTarget{UspVendorId: proto.Uint32(0x1ae0)}},
+		{name: "nil target", target: nil, wantErr: true},
+		{name: "empty target", target: &lmtpb.PcieLinkTarget{}, wantErr: true},
+		{name: "all_links false", target: &lmtpb.PcieLinkTarget{AllLinks: proto.Bool(false)}, wantErr: true},
+		{name: "all_links true", target: &lmtpb.PcieLinkTarget{AllLinks: proto.Bool(true)}},
+		{name: "usp_vendor_id only", target: &lmtpb.PcieLinkTarget{UspVendorId: proto.Uint32(0x1ae0)}},
+		{name: "usp_device_id only", target: &lmtpb.PcieLinkTarget{UspDeviceId: proto.Uint32(0x0075)}},
+		{name: "usp_bdfs only", target: &lmtpb.PcieLinkTarget{UspBdfs: []string{"0000:16:00.0"}}},
+		{name: "dsp_vendor_id only", target: &lmtpb.PcieLinkTarget{DspVendorId: proto.Uint32(0x8086)}},
+		{name: "dsp_device_id only", target: &lmtpb.PcieLinkTarget{DspDeviceId: proto.Uint32(0x352a)}},
+		{name: "dsp_bdfs only", target: &lmtpb.PcieLinkTarget{DspBdfs: []string{"0000:15:01.0"}}},
+		{name: "usp_vendor_id zero is a filter", target: &lmtpb.PcieLinkTarget{UspVendorId: proto.Uint32(0)}},
 		{
 			name: "valid bdfs",
 			target: &lmtpb.PcieLinkTarget{
@@ -356,6 +365,11 @@ func TestValidateLinkTarget(t *testing.T) {
 		{
 			name:    "bus number only",
 			target:  &lmtpb.PcieLinkTarget{UspBdfs: []string{"16"}},
+			wantErr: true,
+		},
+		{
+			name:    "all_links true with malformed bdf",
+			target:  &lmtpb.PcieLinkTarget{AllLinks: proto.Bool(true), DspBdfs: []string{"15:01.0"}},
 			wantErr: true,
 		},
 	}
@@ -382,6 +396,27 @@ func TestMarginLinksRejectsMalformedBDF(t *testing.T) {
 	err := MarginLinks(cfg)
 	if err == nil || !strings.Contains(err.Error(), "malformed BDF") {
 		t.Errorf("MarginLinks(%v) = %v, want a malformed BDF error", cfg, err)
+	}
+}
+
+func TestMarginLinksRejectsEmptyLinkTarget(t *testing.T) {
+	oldPciScanDevices := pciScanDevices
+	defer func() { pciScanDevices = oldPciScanDevices }()
+	pciScanDevices = func() pci.Dev {
+		t.Error("MarginLinks() scanned the PCI devices despite an empty link_target")
+		return pci.Dev{}
+	}
+	for name, cfg := range map[string]*lmtpb.LinkMargin{
+		"no link_target":    {},
+		"empty link_target": {LinkTarget: &lmtpb.PcieLinkTarget{}},
+		"all_links false":   {LinkTarget: &lmtpb.PcieLinkTarget{AllLinks: proto.Bool(false)}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			err := MarginLinks(cfg)
+			if err == nil || !strings.Contains(err.Error(), "all_links") {
+				t.Errorf("MarginLinks(%v) = %v, want an error about the missing filter and all_links", cfg, err)
+			}
+		})
 	}
 }
 

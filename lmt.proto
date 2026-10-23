@@ -31,6 +31,9 @@ message LinkMarginTest {
 // upstream port, or a switch whose ports all share the same IDs.
 // All set fields are ANDed. An unset field is a wildcard that matches any
 // value. The IDs are 16-bit PCI IDs; protobuf has no uint16 type.
+// At least one of the six filter fields (usp_vendor_id, usp_device_id,
+// usp_bdfs, dsp_vendor_id, dsp_device_id, dsp_bdfs) must be set, unless
+// all_links is true. Otherwise the test fails before any link is touched.
 message PcieLinkTarget {
   optional uint32 usp_vendor_id = 1;
   optional uint32 usp_device_id = 2;
@@ -42,6 +45,9 @@ message PcieLinkTarget {
   // The link's DSP must be one of these BDFs, in the format of
   // "0000:00:00.0". An empty list is a wildcard. A malformed BDF is an error.
   repeated string dsp_bdfs = 6;
+  // Explicitly selects every eligible link in the system when no filter field
+  // is set. Any filter field that is set still applies.
+  optional bool all_links = 7;
 }
 
 message LinkMargin {
@@ -58,7 +64,8 @@ message LinkMargin {
   optional string message = 7;  // Some info log from testing on a link.
 
   // Selects the links to test by the IDs and the BDFs of both of their ends.
-  // An unset field is a wildcard; an unset link_target selects every link.
+  // Required: an unset or empty link_target is rejected, unless
+  // link_target.all_links is true.
   optional PcieLinkTarget link_target = 20;
 
   // Receiver identifier on a link, according to the PCIe Base Spec 5.0

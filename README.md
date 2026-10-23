@@ -37,7 +37,10 @@ top-level `LinkMargin` message specifies the PCIe link(s) to test through
 IDs, and BDFs of both the upstream port (`usp_vendor_id`, `usp_device_id`,
 `usp_bdfs`) and downstream port (`dsp_vendor_id`, `dsp_device_id`, `dsp_bdfs`)
 ends of each link (all set fields are ANDed and unset fields or empty BDF lists
-act as wildcards). Each receiver point
+act as wildcards). At least one of these six filter fields must be set, either
+in the spec or through the `-vendor_id`, `-device_id`, `-bus` or `-bdf` flags: a
+spec without any filter fails before any link is touched, unless `link_target`
+sets `all_links: true` to explicitly test every eligible link. Each receiver point
 (upstream port, downstream port, retimers) has a timing spec and/or a voltage
 spec. For production testing, the test spec sets a target offset, a sample count
 (or in terms of a minimum dwell time), and an error limit. The margining passes
@@ -99,7 +102,8 @@ If you wish to use **Bazel 9+**:
 ## Test Spec and Result Examples
 Refer to [lmt.proto](lmt.proto).
 
-Link target filter (all set fields are ANDed; unset fields act as wildcards):
+Link target filter (all set fields are ANDed; unset fields act as wildcards;
+at least one field must be set unless `all_links: true` is set):
 
 ```
 link_target: {
@@ -111,6 +115,14 @@ link_target: {
   dsp_device_id: 0x352a
   dsp_bdfs: "0000:80:01.0"
   dsp_bdfs: "0000:a0:01.0"
+}
+```
+
+To deliberately test every eligible link in the system:
+
+```
+link_target: {
+  all_links: true
 }
 ```
 
