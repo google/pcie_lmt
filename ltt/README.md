@@ -11,7 +11,11 @@ test through `link_target` (`PcieLinkTarget`), which matches the vendor IDs,
 device IDs, and BDFs of both the upstream port (`usp_vendor_id`,
 `usp_device_id`, `usp_bdfs`) and downstream port (`dsp_vendor_id`,
 `dsp_device_id`, `dsp_bdfs`) ends of each link. All set fields in `link_target`
-are ANDed, and unset fields (or empty BDF lists) act as wildcards. PCIe config
+are ANDed, and unset fields (or empty BDF lists) act as wildcards. At least one
+of these six filter fields must be set, either in the spec or through the `-bdf`
+or `-bus` flags: a spec without any filter fails before any link is touched,
+unless `link_target` sets `all_links: true` to explicitly train every eligible
+link. PCIe config
 space register fields are specified in the proto for checking and logging. The
 proto also includes the number of link training iterations and pass/fail counts.
 
@@ -54,6 +58,9 @@ link_target {
   dsp_bdfs: "0000:80:01.0"
   dsp_bdfs: "0000:a0:01.0"
 }
+# To deliberately train every eligible link instead, replace the filters above
+# with:
+#   link_target { all_links: true }
 
 iterations: 100
 method: M_REENABLE  # Other options are M_SBR or M_RETRAIN_DEFAULT

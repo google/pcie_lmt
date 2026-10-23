@@ -310,7 +310,7 @@ func TestLinkTrainNoPciDevices(t *testing.T) {
 	oldPciScanDevices := pciScanDevices
 	pciScanDevices = func() pci.Dev { return pci.Dev{} }
 	defer func() { pciScanDevices = oldPciScanDevices }()
-	_, err := LinkTrain(&pb.LinkTrain{})
+	_, err := LinkTrain(&pb.LinkTrain{LinkTarget: &pb.PcieLinkTarget{AllLinks: proto.Bool(true)}})
 	if err == nil || err.Error() != "no pcie devices found" {
 		t.Errorf("LinkTrain() with no pci devices returned %v, want error 'no pcie devices found'", err)
 	}
@@ -355,7 +355,7 @@ func TestLinkTrainRuns(t *testing.T) {
 		testRunEnd = nil
 	}()
 
-	pass, err := LinkTrain(&pb.LinkTrain{})
+	pass, err := LinkTrain(&pb.LinkTrain{LinkTarget: &pb.PcieLinkTarget{AllLinks: proto.Bool(true)}})
 	if err != nil && err.Error() == "no pcie devices found" {
 		t.Skipf("Skipping test: pci.ScanDevices() found no devices, cannot test full LinkTrain run.")
 	}
@@ -816,8 +816,17 @@ func TestValidateLinkTarget(t *testing.T) {
 		target  *pb.PcieLinkTarget
 		wantErr bool
 	}{
-		{name: "nil target", target: nil},
-		{name: "no bdfs", target: &pb.PcieLinkTarget{UspVendorId: proto.Uint32(0x1ae0)}},
+		{name: "nil target", target: nil, wantErr: true},
+		{name: "empty target", target: &pb.PcieLinkTarget{}, wantErr: true},
+		{name: "all_links false", target: &pb.PcieLinkTarget{AllLinks: proto.Bool(false)}, wantErr: true},
+		{name: "all_links true", target: &pb.PcieLinkTarget{AllLinks: proto.Bool(true)}},
+		{name: "usp_vendor_id only", target: &pb.PcieLinkTarget{UspVendorId: proto.Uint32(0x1ae0)}},
+		{name: "usp_device_id only", target: &pb.PcieLinkTarget{UspDeviceId: proto.Uint32(0x0075)}},
+		{name: "usp_bdfs only", target: &pb.PcieLinkTarget{UspBdfs: []string{"0000:16:00.0"}}},
+		{name: "dsp_vendor_id only", target: &pb.PcieLinkTarget{DspVendorId: proto.Uint32(0x8086)}},
+		{name: "dsp_device_id only", target: &pb.PcieLinkTarget{DspDeviceId: proto.Uint32(0x352a)}},
+		{name: "dsp_bdfs only", target: &pb.PcieLinkTarget{DspBdfs: []string{"0000:15:01.0"}}},
+		{name: "usp_vendor_id zero is a filter", target: &pb.PcieLinkTarget{UspVendorId: proto.Uint32(0)}},
 		{
 			name: "valid bdfs",
 			target: &pb.PcieLinkTarget{
@@ -838,6 +847,11 @@ func TestValidateLinkTarget(t *testing.T) {
 		{
 			name:    "bus number only",
 			target:  &pb.PcieLinkTarget{UspBdfs: []string{"16"}},
+			wantErr: true,
+		},
+		{
+			name:    "all_links true with malformed bdf",
+			target:  &pb.PcieLinkTarget{AllLinks: proto.Bool(true), DspBdfs: []string{"15:01.0"}},
 			wantErr: true,
 		},
 	}
@@ -864,6 +878,27 @@ func TestLinkTrainRejectsMalformedBDF(t *testing.T) {
 	_, err := LinkTrain(cfg)
 	if err == nil || !strings.Contains(err.Error(), "malformed BDF") {
 		t.Errorf("LinkTrain(%v) = %v, want a malformed BDF error", cfg, err)
+	}
+}
+
+func TestLinkTrainRejectsEmptyLinkTarget(t *testing.T) {
+	oldPciScanDevices := pciScanDevices
+	defer func() { pciScanDevices = oldPciScanDevices }()
+	pciScanDevices = func() pci.Dev {
+		t.Error("LinkTrain() scanned the PCI devices despite an empty link_target")
+		return pci.Dev{}
+	}
+	for name, cfg := range map[string]*pb.LinkTrain{
+		"no link_target":    {},
+		"empty link_target": {LinkTarget: &pb.PcieLinkTarget{}},
+		"all_links false":   {LinkTarget: &pb.PcieLinkTarget{AllLinks: proto.Bool(false)}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := LinkTrain(cfg)
+			if err == nil || !strings.Contains(err.Error(), "all_links") {
+				t.Errorf("LinkTrain(%v) = %v, want an error about the missing filter and all_links", cfg, err)
+			}
+		})
 	}
 }
 

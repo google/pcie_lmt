@@ -551,10 +551,18 @@ func matchBDF(bdfs []string, d pci.PCIDevInfo) bool {
 	return false
 }
 
-// validateLinkTarget returns an error if any BDF in the link target is
-// malformed, so that a typo fails the test instead of silently matching
-// nothing.
+// validateLinkTarget returns an error if the link target sets no filter field
+// and does not set all_links, so that a spec that lost its filters fails the
+// test instead of silently training every link, or if any BDF in the link
+// target is malformed, so that a typo fails the test instead of silently
+// matching nothing. A nil target sets no filter field.
 func validateLinkTarget(target *pb.PcieLinkTarget) error {
+	hasFilter := target != nil &&
+		(target.UspVendorId != nil || target.UspDeviceId != nil || len(target.GetUspBdfs()) > 0 ||
+			target.DspVendorId != nil || target.DspDeviceId != nil || len(target.GetDspBdfs()) > 0)
+	if !hasFilter && !target.GetAllLinks() {
+		return errors.New("link_target sets no filter field (usp_vendor_id, usp_device_id, usp_bdfs, dsp_vendor_id, dsp_device_id or dsp_bdfs) and all_links is not true; refusing to train every link")
+	}
 	for _, bdf := range slices.Concat(target.GetUspBdfs(), target.GetDspBdfs()) {
 		if _, _, _, _, err := pci.ParseBDF(bdf); err != nil {
 			return fmt.Errorf("malformed BDF %q in link_target: %w", bdf, err)
