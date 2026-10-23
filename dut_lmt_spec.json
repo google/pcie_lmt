@@ -13,12 +13,14 @@
 // limitations under the License.
 
 {
-  "vendor_id":  4096,
-  "device_id":  49200,
-  "bdf":  [
-    "0000:81:00.0",
-    "0000:a1:00.0"
-  ],
+  "link_target":  {
+    "usp_vendor_id":  4096,
+    "usp_device_id":  49200,
+    "usp_bdfs":  [
+      "0000:81:00.0",
+      "0000:a1:00.0"
+    ]
+  },
   "test_specs":  [
     {
       "receiver":  "R_DSP_A1",

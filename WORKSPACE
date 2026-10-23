@@ -35,7 +35,7 @@ load("@bazel_gazelle//:deps.bzl", "gazelle_dependencies", "go_repository")
 
 go_rules_dependencies()
 
-go_register_toolchains(version = "1.22.2")
+go_register_toolchains(version = "1.26.8")
 
 gazelle_dependencies()
 
@@ -54,6 +54,13 @@ http_archive(
     sha256 = "feaeeb315133ea5e3b046c2c0231f5b86ef9d297e536a14b73e0393335f8b157",
     strip_prefix = "grpc-1.51.3",
     url = "https://github.com/grpc/grpc/archive/refs/tags/v1.51.3.tar.gz",
+)
+
+go_repository(
+    name = "com_github_google_go_cmp",
+    importpath = "github.com/google/go-cmp",
+    sum = "h1:ofyhxvXcZhMsU5ulbFiLKl/XBFqE1GSq7atu8tAmTRI=",
+    version = "v0.6.0",
 )
 
 go_repository(

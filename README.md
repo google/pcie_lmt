@@ -32,7 +32,12 @@ test explores the error rate both timing-wise and voltage-wise. Here's a
 - Linux-only: LMT uses the pciutils lib, which is behind the lspci and setpci tools.
 
 A [lmt.proto](lmt.proto) specifies all aspects of the test, as well as logging the test result. The
-top-level proto message specifies the PCIe link(s) to test. Each receiver point
+top-level `LinkMargin` message specifies the PCIe link(s) to test through
+`link_target` (`PcieLinkTarget`), which selects links by the vendor IDs, device
+IDs, and BDFs of both the upstream port (`usp_vendor_id`, `usp_device_id`,
+`usp_bdfs`) and downstream port (`dsp_vendor_id`, `dsp_device_id`, `dsp_bdfs`)
+ends of each link (all set fields are ANDed and unset fields or empty BDF lists
+act as wildcards). Each receiver point
 (upstream port, downstream port, retimers) has a timing spec and/or a voltage
 spec. For production testing, the test spec sets a target offset, a sample count
 (or in terms of a minimum dwell time), and an error limit. The margining passes
@@ -93,6 +98,21 @@ If you wish to use **Bazel 9+**:
 
 ## Test Spec and Result Examples
 Refer to [lmt.proto](lmt.proto).
+
+Link target filter (all set fields are ANDed; unset fields act as wildcards):
+
+```
+link_target: {
+  usp_vendor_id: 0x1000
+  usp_device_id: 0xc030
+  usp_bdfs: "0000:81:00.0"
+  usp_bdfs: "0000:a1:00.0"
+  dsp_vendor_id: 0x8086
+  dsp_device_id: 0x352a
+  dsp_bdfs: "0000:80:01.0"
+  dsp_bdfs: "0000:a0:01.0"
+}
+```
 
 Test spec for eye-corner-scan:
 

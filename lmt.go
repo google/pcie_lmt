@@ -30,6 +30,7 @@ import (
 	log "github.com/golang/glog"
 	"google.golang.org/protobuf/encoding/protojson"
 	lmt "local/lanemargintest"
+	lmtpb "lmt_go.proto"
 )
 
 var (
@@ -40,18 +41,18 @@ var (
 	version   = "2024-02-04"
 	buildTime = "unknown"
 
-	getVer   = flag.Bool("version", false, "Return the version number.")
-	vid      = flag.Int("vendor_id", -1, "The 16-bit Vendor ID of the USP (such as the EP).")
-	did      = flag.Int("device_id", -1, "The 16-bit Device ID of the USP (such as the EP).")
-	bus      = flag.String("bus", "", "Deprecated. Use -bdf instead. A comma-separted list of bus numbers.")
-	bdf      = flag.String("bdf", "", "A comma-separted list of DDDD:BB:dd:f numbers.")
-	spec     = flag.String("spec", "", "The test spec .pbtxt file.")
-	specJSON = flag.String("spec_json", "", "The test spec .json file.")
-	result   = flag.String("result", "result.pbtxt", "The result pbtxt file name.")
-	csv      = flag.String("csv", "", "Dumps a csv file for plotting.")
-	resultToCSV   = flag.Bool("result_to_csv", false, "[Deprecated] Converts the [result] to a [csv] file for plotting.")
-	resultToHTML  = flag.Bool("result_to_html", false, "Converts the [result] to a [.html] test report with plotting.")
-	ocpPipe  = flag.String("ocp_pipe", "/dev/null", "Named pipe or file to stream the OCP Artifacts.")
+	getVer       = flag.Bool("version", false, "Return the version number.")
+	vid          = flag.Int("vendor_id", -1, "The 16-bit Vendor ID of the USP (such as the EP).")
+	did          = flag.Int("device_id", -1, "The 16-bit Device ID of the USP (such as the EP).")
+	bus          = flag.String("bus", "", "Deprecated. Use -bdf instead. A comma-separated list of bus numbers.")
+	bdf          = flag.String("bdf", "", "A comma-separated list of DDDD:BB:dd.f numbers.")
+	spec         = flag.String("spec", "", "The test spec .pbtxt file.")
+	specJSON     = flag.String("spec_json", "", "The test spec .json file.")
+	result       = flag.String("result", "result.pbtxt", "The result pbtxt file name.")
+	csv          = flag.String("csv", "", "Dumps a csv file for plotting.")
+	resultToCSV  = flag.Bool("result_to_csv", false, "[Deprecated] Converts the [result] to a [csv] file for plotting.")
+	resultToHTML = flag.Bool("result_to_html", false, "Converts the [result] to a [.html] test report with plotting.")
+	ocpPipe      = flag.String("ocp_pipe", "/dev/null", "Named pipe or file to stream the OCP Artifacts.")
 )
 
 func main() {
@@ -108,52 +109,46 @@ func main() {
 		if *vid < 0 || *vid > 0xFFFF {
 			log.Exit("The vendor_id = ", fmt.Sprintf("%04x", *vid), " option is out of range [0:0xFFFF].")
 		}
+		if cfg.LinkTarget == nil {
+			cfg.LinkTarget = &lmtpb.PcieLinkTarget{}
+		}
 		vendorID := uint32(*vid)
-		cfg.VendorId = &vendorID
+		cfg.LinkTarget.UspVendorId = &vendorID
 	}
-	// Overrides Vendor ID from command line flags.
+	// Overrides Device ID from command line flags.
 	if *did != -1 {
 		if *did < 0 || *did > 0xFFFF {
 			log.Exit("The device_id = ", fmt.Sprintf("%04x", *did), " option is out of range [0:0xFFFF].")
 		}
+		if cfg.LinkTarget == nil {
+			cfg.LinkTarget = &lmtpb.PcieLinkTarget{}
+		}
 		deviceID := uint32(*did)
-		cfg.DeviceId = &deviceID
+		cfg.LinkTarget.UspDeviceId = &deviceID
 	}
 
 	// Overrides BDF from command line flags.
 	if *bus != "" {
-		busList := strings.Split(*bus, ",")
-		if len(busList) != 0 {
-			cfg.Bdf = ([]string{})
-			for _, busstr := range busList {
-				if bus, err := strconv.ParseUint(busstr, 0, 32); err != nil {
-					log.Error(busstr, " is not a valid bus number format.")
-				} else {
-					cfg.Bdf = append(cfg.GetBdf(), fmt.Sprintf("%04x:%02x:%02x.%d", 0, bus, 0, 0))
-				}
+		var bdfs []string
+		for _, busstr := range strings.Split(*bus, ",") {
+			busstr = strings.TrimSpace(busstr)
+			if busstr == "" {
+				continue
 			}
+			b, err := strconv.ParseUint(busstr, 0, 8)
+			if err != nil {
+				log.Exitf("Invalid -bus %q: %v", *bus, err)
+			}
+			bdfs = append(bdfs, fmt.Sprintf("0000:%02x:00.0", b))
+		}
+		if err := lmt.OverrideUSPBDFs(cfg, bdfs); err != nil {
+			log.Exitf("Invalid -bus %q: %v", *bus, err)
 		}
 	}
 
 	if *bdf != "" {
-		bdfList := strings.Split(*bdf, ",")
-		if len(bdfList) != 0 {
-			cfg.Bdf = ([]string{})
-			for _, bdfstr := range bdfList {
-				domain := uint16(0)
-				b := uint8(0)
-				d := uint8(0)
-				f := uint8(0)
-				if n, _ := fmt.Sscanf(bdfstr, "%04x:%02x:%02x.%d", &domain, &b, &d, &f); n == 4 {
-					cfg.Bdf = append(cfg.GetBdf(), fmt.Sprintf("%04x:%02x:%02x.%d", domain, b, d, f))
-					continue
-				} else if n, _ := fmt.Sscanf(bdfstr, "%02x", &b); n == 1 {
-					cfg.Bdf = append(cfg.GetBdf(), fmt.Sprintf("%04x:%02x:%02x.%d", 0, b, 0, 0))
-					continue
-				} else {
-					log.Error(bdfstr, " is not a valid BDF in DDDD:BB:dd:f format.")
-				}
-			}
+		if err := lmt.OverrideUSPBDFs(cfg, strings.Split(*bdf, ",")); err != nil {
+			log.Exitf("Invalid -bdf %q: %v", *bdf, err)
 		}
 	}
 

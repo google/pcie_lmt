@@ -13,7 +13,7 @@
 # limitations under the License.
 
 load("@bazel_gazelle//:def.bzl", "gazelle")
-load("@io_bazel_rules_go//go:def.bzl", "go_binary", "go_library")
+load("@io_bazel_rules_go//go:def.bzl", "go_binary", "go_library", "go_test")
 load("@io_bazel_rules_go//proto:def.bzl", "go_proto_library")
 load("@rules_proto//proto:defs.bzl", "proto_library")
 
@@ -45,9 +45,12 @@ go_library(
         "lmt_cmdrsp.go",
         "lmt_lane.go",
         "lmt_link.go",
+        "lmt_margin_hook.go",
+        "lmt_ocp_writer.go",
         "lmt_offset.go",
         "lmt_result2csv.go",
         "lmt_result2html.go",
+        "lmt_scheduler.go",
         "lmt_tally.go",
     ],
     cdeps = [
@@ -68,6 +71,23 @@ go_library(
     ],
 )
 
+go_test(
+    name = "lanemargintest_test",
+    srcs = [
+        "fake_lmr_test.go",
+        "lanemargintest_test.go",
+        "lmt_cmdrsp_test.go",
+        "lmt_lane_test.go",
+        "lmt_link_test.go",
+        "lmt_margin_hook_test.go",
+        "lmt_ocp_writer_test.go",
+        "lmt_offset_test.go",
+        "lmt_scheduler_test.go",
+        "log_capture_test.go",
+    ],
+    embed = [":lanemargintest"],
+)
+
 # USE_BAZEL_VERSION=7.5.0 bazelisk \
 # bazel build //:lmt \
 #   --define pci_link=dynamic \
@@ -81,6 +101,7 @@ go_binary(
     },
     deps = [
         ":lanemargintest",
+        ":lmt_go_proto",
         "@com_github_golang_glog//:go_default_library",
         "@ocpdiag//:results_go_proto",
         "@org_golang_google_protobuf//encoding/protojson",
@@ -104,4 +125,10 @@ go_library(
     deps = [
         "@com_github_golang_glog//:go_default_library",
     ],
+)
+
+go_test(
+    name = "pciutils_test",
+    srcs = ["pciutils_test.go"],
+    embed = [":pciutils"],
 )

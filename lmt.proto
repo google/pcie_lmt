@@ -25,19 +25,41 @@ message LinkMarginTest {
   repeated LinkMargin link_margin = 1;
 }
 
+// Identifies a PCIe link by the PCI <vendor_id, device_id> and the BDFs of
+// both of its ends, which disambiguates links whose USPs share the same IDs,
+// e.g. a NIC whose internal downstream port has the same IDs as its external
+// upstream port, or a switch whose ports all share the same IDs.
+// All set fields are ANDed. An unset field is a wildcard that matches any
+// value. The IDs are 16-bit PCI IDs; protobuf has no uint16 type.
+message PcieLinkTarget {
+  optional uint32 usp_vendor_id = 1;
+  optional uint32 usp_device_id = 2;
+  // The link's USP must be one of these BDFs, in the format of
+  // "0000:00:00.0". An empty list is a wildcard. A malformed BDF is an error.
+  repeated string usp_bdfs = 3;
+  optional uint32 dsp_vendor_id = 4;
+  optional uint32 dsp_device_id = 5;
+  // The link's DSP must be one of these BDFs, in the format of
+  // "0000:00:00.0". An empty list is a wildcard. A malformed BDF is an error.
+  repeated string dsp_bdfs = 6;
+}
+
 message LinkMargin {
-  // The following optional fields are use to select PCIe USP in the system
-  // to conduct the link training test.
-  // USPs can be chosen by vendor and device IDs.
-  // The DSP of a link is inferred from the USP.
-  optional uint32 vendor_id = 1;
-  optional uint32 device_id = 2;
-  // Assumes domain==0, device==0, and function=0
-  // USPs can also be chosen by BDFs in the format of "0000:00:00.0".
-  repeated string bdf = 4;
-  optional string usp_bdf = 5;  // reported USP's BDF in the link under test.
-  optional string dsp_bdf = 6;  // reported DSP's BDF in the link under test.
+  // The former USP filters vendor_id = 1, device_id = 2 and bdf = 4, replaced
+  // by link_target. Only the numbers are reserved, not the names: Go prototext
+  // and C++ TextFormat silently skip a reserved field name, so a spec that
+  // still sets a legacy filter would silently lose it, and could select every
+  // link, instead of failing to parse.
+  reserved 1, 2, 4;
+
+  // Output only. The BDFs of the USP and the DSP of the tested link.
+  optional string usp_bdf = 5;
+  optional string dsp_bdf = 6;
   optional string message = 7;  // Some info log from testing on a link.
+
+  // Selects the links to test by the IDs and the BDFs of both of their ends.
+  // An unset field is a wildcard; an unset link_target selects every link.
+  optional PcieLinkTarget link_target = 20;
 
   // Receiver identifier on a link, according to the PCIe Base Spec 5.0
   // 4.2.13.1. The enumeration corresponds to the 3-bit Receiver Number

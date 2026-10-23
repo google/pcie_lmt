@@ -73,7 +73,7 @@ func ConvertToHTML(htmlfn string) {
 
 	link := uint32(0)
 	for _, lm := range lmts.GetLinkMargin() {
-		if lm.GetReceiverLanes() == nil {
+		if len(lm.GetReceiverLanes()) == 0 {
 			continue
 		}
 		// make portwidth a multiple of 5 to leave gap and ease indexing.
@@ -298,7 +298,7 @@ func ConvertToHTML(htmlfn string) {
 	fmt.Fprintln(f, "        <pre>")
 	for _, lm := range lmts.GetLinkMargin() {
 		if lm.GetMessage() != "" {
-			fmt.Fprintf(f, "BDF %s (USP: %s, DSP: %s):\n", lm.GetBdf(), lm.GetUspBdf(), lm.GetDspBdf())
+			fmt.Fprintf(f, "Link (USP: %s, DSP: %s):\n", lm.GetUspBdf(), lm.GetDspBdf())
 			parts := strings.Split(lm.GetMessage(), "|")
 			for _, part := range parts {
 				trimmed := strings.TrimSpace(part)

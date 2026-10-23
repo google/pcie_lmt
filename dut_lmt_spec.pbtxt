@@ -12,14 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# proto-file: third_party/pcie_lmt/lmt.proto
+# proto-file: lmt.proto
 # proto-message: LinkMargin
 
-vendor_id: 0x1000
-device_id: 0xc030
-
-bdf: "0000:81:00.0"
-bdf: "0000:a1:00.0"
+link_target {
+  usp_vendor_id: 0x1000
+  usp_device_id: 0xc030
+  usp_bdfs: "0000:81:00.0"
+  usp_bdfs: "0000:a1:00.0"
+}
 
 ################################################################################
 # Lane parameter references:

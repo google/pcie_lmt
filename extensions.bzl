@@ -4,6 +4,8 @@ load("@bazel_tools//tools/build_defs/repo:git.bzl", "git_repository")
 load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
 
 def _non_module_deps_impl(ctx):
+    _ = ctx  # Unused but required by caller
+
     # ocpdiag
     git_repository(
         name = "ocpdiag",

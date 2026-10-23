@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// This is a standalone PCIe link training test
+// Package main implements a standalone PCIe link training test tool.
 package main
 
 import (
@@ -42,8 +42,8 @@ var (
 	cfgfn          = flag.String("cfgpb", "", "Config pbtxt file name")
 	resfn          = flag.String("outpb", "result.pbtxt", "Result pbtxt file name")
 	bus            = flag.String("bus", "", "Deprecated. Use -bdf instead. A comma-separted list of bus numbers.")
-	bdf            = flag.String("bdf", "", "A comma-separted list of DDDD:BB:dd:f numbers.")
-	method         = flag.String("method", "", "Link training method: retrain, sbr, or reenable")
+	bdf            = flag.String("bdf", "", "A comma-separted list of DDDD:BB:dd.f numbers.")
+	method         = flag.String("method", "", "Link training method: retrain, retrain_with_eq, sbr, or reenable")
 	iterations     = flag.Int("iterations", 0, "The number of link training iterations.")
 	parallel       = flag.Bool("parallel", true, "If true, tests multiple links in parallel.")
 	teardownwaitms = flag.Int("teardownwaitms", -1, "Wait in milliseconds after teardown.")
@@ -83,38 +83,26 @@ func main() {
 
 	// Overrides BDF from command line flags.
 	if *bus != "" {
-		busList := strings.Split(*bus, ",")
-		if len(busList) != 0 {
-			cfg.Bdf = ([]string{})
-			for _, busstr := range busList {
-				if bus, err := strconv.ParseUint(busstr, 0, 32); err != nil {
-					log.Error(busstr, " is not a valid bus number format.")
-				} else {
-					cfg.Bdf = append(cfg.GetBdf(), fmt.Sprintf("%04x:%02x:%02x.%d", 0, bus, 0, 0) )
-				}
+		var bdfs []string
+		for _, busstr := range strings.Split(*bus, ",") {
+			busstr = strings.TrimSpace(busstr)
+			if busstr == "" {
+				continue
 			}
+			b, err := strconv.ParseUint(busstr, 0, 8)
+			if err != nil {
+				log.Exitf("Invalid -bus %q: %v", *bus, err)
+			}
+			bdfs = append(bdfs, fmt.Sprintf("0000:%02x:00.0", b))
+		}
+		if err := lt.OverrideUSPBDFs(cfg, bdfs); err != nil {
+			log.Exitf("Invalid -bus %q: %v", *bus, err)
 		}
 	}
 
 	if *bdf != "" {
-		bdfList := strings.Split(*bdf, ",")
-		if len(bdfList) != 0 {
-			cfg.Bdf = ([]string{})
-			for _, bdfstr := range bdfList {
-				domain := uint16(0)
-				b := uint8(0)
-				d := uint8(0)
-				f := uint8(0)
-				if n, _ := fmt.Sscanf(bdfstr, "%04x:%02x:%02x.%d", &domain, &b, &d, &f); n == 4 {
-					cfg.Bdf = append(cfg.GetBdf(), fmt.Sprintf("%04x:%02x:%02x.%d", domain, b, d, f))
-					continue
-				} else if n, _ := fmt.Sscanf(bdfstr, "%02x", &b); n == 1 {
-					cfg.Bdf = append(cfg.GetBdf(), fmt.Sprintf("%04x:%02x:%02x.%d", 0, b, 0, 0))
-					continue
-				} else {
-					log.Error(bdfstr, " is not a valid BDF in DDDD:BB:dd:f format.")
-				}
-			}
+		if err := lt.OverrideUSPBDFs(cfg, strings.Split(*bdf, ",")); err != nil {
+			log.Exitf("Invalid -bdf %q: %v", *bdf, err)
 		}
 	}
 
@@ -123,6 +111,9 @@ func main() {
 	case "retrain":
 		cfg.Method = pb.LinkTrain_M_RETRAIN_DEFAULT
 		log.V(0).Infoln("cfgpb.method overridden to ", pb.LinkTrain_M_RETRAIN_DEFAULT.String())
+	case "retrain_with_eq":
+		cfg.Method = pb.LinkTrain_M_RETRAIN_WITH_EQ
+		log.V(0).Infoln("cfgpb.method overridden to ", pb.LinkTrain_M_RETRAIN_WITH_EQ.String())
 	case "sbr":
 		cfg.Method = pb.LinkTrain_M_SBR
 		log.V(0).Infoln("cfgpb.method overridden to ", pb.LinkTrain_M_SBR.String())
@@ -131,7 +122,7 @@ func main() {
 		log.V(0).Infoln("cfgpb.method overridden to ", pb.LinkTrain_M_REENABLE.String())
 	case "": // The method flag is not set.
 	default:
-		log.Exit("Unknown method: ", *method, "; expecting retrain, sbr, or reenable.")
+		log.Exit("Unknown method: ", *method, "; expecting retrain, retrain_with_eq, sbr, or reenable.")
 	}
 
 	// Overrides iterations from command line flags.

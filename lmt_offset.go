@@ -22,10 +22,8 @@ import (
 	"strings"
 	"time"
 
-	structpb "google.golang.org/protobuf/types/known/structpb"
-	ocppb "ocpdiag/results_go_proto"
+	log "github.com/golang/glog"
 	lmtpb "lmt_go.proto"
-	pci "pciutils"
 )
 
 const (
@@ -34,23 +32,13 @@ const (
 	marginTimeout = 1000 * time.Millisecond // Margining setup spec timeout is 200ms.
 )
 
-// margin() conducts either a timing or a voltage margining at one offset on a
-// receiver Lane. The result is logged in a LinkMargin_Lane_MarginPoint.
-// The offset includes the direction bit, [6] for timing and [7] for voltage.
-// The offset is used as the command payload as is.
-func (ln *Lane) margin(offset uint16, t *aspect) (
-	*lmtpb.LinkMargin_Lane_MarginPoint, error) {
-
+// prepareMarginCmdAndPoint composes the margin command at offset on ln, and
+// creates its MarginPoint with the direction, the steps, and the voltage or
+// timing offset. It appends the point to ln.vsteps or ln.tsteps.
+func prepareMarginCmdAndPoint(ln *Lane, offset uint16, t *aspect) (
+	cmdRsp, *lmtpb.LinkMargin_Lane_MarginPoint) {
 	// Creates a new MarginPoint message.
 	point := new(lmtpb.LinkMargin_Lane_MarginPoint)
-	var err error
-	err = nil
-	defer func() {
-		if err != nil {
-			e := err.Error()
-			point.Error = &e
-		}
-	}()
 
 	// Composes the margin command.
 	var cmd cmdRsp
@@ -61,7 +49,6 @@ func (ln *Lane) margin(offset uint16, t *aspect) (
 	// Identifies the up-down/left-right directions
 	var dir lmtpb.LinkMargin_Lane_MarginPoint_DirectionEnum
 	var steps uint16
-	var ocpName string
 	if t.VnotT {
 		cmd.typ = MarginTypeVoltage
 		steps = offset &^ VoltageDirMask
@@ -72,14 +59,11 @@ func (ln *Lane) margin(offset uint16, t *aspect) (
 		if ln.param.GetIndUpDownVoltage() {
 			if (offset & VoltageDirMask) == 0 {
 				dir = lmtpb.LinkMargin_Lane_MarginPoint_D_UP
-				ocpName = fmt.Sprintf("V:+%fV", vv)
 			} else {
 				dir = lmtpb.LinkMargin_Lane_MarginPoint_D_DOWN
-				ocpName = fmt.Sprintf("V:-%fV", vv)
 			}
 		} else {
 			dir = lmtpb.LinkMargin_Lane_MarginPoint_D_UD
-			ocpName = fmt.Sprintf("V:%fV", vv)
 		}
 	} else {
 		cmd.typ = MarginTypeTiming
@@ -91,18 +75,34 @@ func (ln *Lane) margin(offset uint16, t *aspect) (
 		if ln.param.GetIndLeftRightTiming() {
 			if (offset & TimingDirMask) == 0 {
 				dir = lmtpb.LinkMargin_Lane_MarginPoint_D_RIGHT
-				ocpName = fmt.Sprintf("T:+%fUI", ui)
 			} else {
 				dir = lmtpb.LinkMargin_Lane_MarginPoint_D_LEFT
-				ocpName = fmt.Sprintf("T:-%fUI", ui)
 			}
 		} else {
 			dir = lmtpb.LinkMargin_Lane_MarginPoint_D_LR
-			ocpName = fmt.Sprintf("T:%fUI", ui)
 		}
 	}
 	point.Direction = dir
 	point.Steps = uint32(steps)
+	return cmd, point
+}
+
+// margin() conducts either a timing or a voltage margining at one offset on a
+// receiver Lane. The result is logged in a LinkMargin_Lane_MarginPoint.
+// The offset includes the direction bit, [6] for timing and [7] for voltage.
+// The offset is used as the command payload as is.
+func (ln *Lane) margin(offset uint16, t *aspect) (
+	*lmtpb.LinkMargin_Lane_MarginPoint, error) {
+
+	cmd, point := prepareMarginCmdAndPoint(ln, offset, t)
+	var err error
+	err = nil
+	defer func() {
+		if err != nil {
+			e := err.Error()
+			point.Error = &e
+		}
+	}()
 
 	// Executes the command
 	var rsp *cmdRsp
@@ -152,7 +152,7 @@ looping:
 			}
 			// Rereads the status after a fixed period.
 			time.Sleep(marginWait)
-			rsp.decode(uint16(pci.ReadWord(ln.dev, ln.addr+2)))
+			rsp.decode(readWord(ln.dev, ln.addr+2))
 		case StepMarginExecutionStatusMargining:
 			// Starts the actual dwell clock.
 			if tDwellStart.IsZero() {
@@ -170,7 +170,7 @@ looping:
 			}
 			// Rereads the status after a fixed period
 			time.Sleep(marginWait)
-			rsp.decode(uint16(pci.ReadWord(ln.dev, ln.addr+2)))
+			rsp.decode(readWord(ln.dev, ln.addr+2))
 		default:
 			point.Status = lmtpb.LinkMargin_Lane_MarginPoint_S_UNKNOWN
 			break looping
@@ -205,7 +205,7 @@ looping:
 	}
 	fmt.Printf(
 		"Point margin: BDF:%s Rx:%-9s Ln:%2d  Dir:%-8s Step:%3d  Status:%-13s ErrCnt:%2d  Samples:%3d\n",
-		ln.cfg.GetBdf()[0], ln.rec.String(), ln.laneNumber, point.GetDirection().String(),
+		ln.cfg.GetUspBdf(), ln.rec.String(), ln.laneNumber, point.GetDirection().String(),
 		point.GetSteps(), point.GetStatus().String(), point.GetErrorCount(), point.GetSampleCount())
 
 	if point.GetStatus() != lmtpb.LinkMargin_Lane_MarginPoint_S_MARGINING {
@@ -218,61 +218,62 @@ looping:
 		}
 	}
 
-	// Stream OCP TestStepMeasurement artifact
-	var unit string
-	if t.VnotT {
-		unit = fmt.Sprintf("Unit=V;Step=%03d;Dir=%-8s;Offset=%6.4f",
-			point.GetSteps(), strings.TrimPrefix(point.GetDirection().String(), "D_"), point.GetVoltage())
-	} else {
-		unit = fmt.Sprintf("Unit=UI;Step=%03d;Dir=%-8s;Offset=%5.3f",
-			point.GetSteps(), strings.TrimPrefix(point.GetDirection().String(), "D_"), point.GetPercentUi())
-	}
-	subcomp := &ocppb.Subcomponent{
-		Type: ocppb.Subcomponent_BUS,
-		Name: "PCIELMT-MARGINPOINT-PCI",
-		Location: fmt.Sprintf("BDF=%s;RX=%1d;LN=%02d;Offset=%s",
-			ln.cfg.GetBdf()[0], ln.rec.Number(), ln.laneNumber, ocpName),
-	}
-
-	if !t.eyeScanMode || point.GetStatus() != lmtpb.LinkMargin_Lane_MarginPoint_S_MARGINING {
-		m := &ocppb.Measurement{
-			Name:           fmt.Sprintf("LN=%02d;Step-Status", ln.laneNumber),
-			Value:          structpb.NewStringValue(strings.TrimPrefix(point.GetStatus().String(), "S_")),
-			Unit:           unit,
-			HardwareInfoId: ln.rx.hwinfo,
-			Subcomponent:   subcomp,
-			Validators:     []*ocppb.Validator{ln.statusVal},
+	// Calls the margin hooks, e.g. to stream the OCP TestStepMeasurement artifacts.
+	for _, h := range ln.rx.marginHooks {
+		if err := h.PostMargin(ln, t, point, bitCount, dwellActual); err != nil {
+			log.Warningf("%s: %s.PostMargin: %v", ln.laneRepr(), h.Name(), err)
 		}
-		ln.mStepArti.Artifact = &ocppb.TestStepArtifact_Measurement{Measurement: m}
-		outputArtifact(ln.stepArtiOut)
-	}
-
-	if (point.GetStatus() == lmtpb.LinkMargin_Lane_MarginPoint_S_MARGINING ||
-		point.GetStatus() == lmtpb.LinkMargin_Lane_MarginPoint_S_ERROR_OUT) && (!t.eyeScanMode ||
-		point.ErrorCount != 0) {
-		m := &ocppb.Measurement{
-			Name:           fmt.Sprintf("LN=%02d;Step-BER", ln.laneNumber),
-			Value:          structpb.NewNumberValue(float64(point.ErrorCount) / bitCount),
-			Unit:           unit,
-			HardwareInfoId: ln.rx.hwinfo,
-			Subcomponent:   subcomp,
-		}
-		if !t.errOutOK {
-			m.Validators = []*ocppb.Validator{ln.berVal}
-		}
-		ln.mStepArti.Artifact = &ocppb.TestStepArtifact_Measurement{Measurement: m}
-		outputArtifact(ln.stepArtiOut)
 	}
 
 	// Issues "Clear Error Log" and "Go to Normal Settings" commands
+	return point, sendPostMarginCmds(ln)
+}
+
+// sendPostMarginCmds issues the "Clear Error Log" and "Go to Normal Settings"
+// commands to the receiver of ln. It stops at the first command that fails.
+func sendPostMarginCmds(ln *Lane) error {
+	var cmd cmdRsp
+	cmd.rec = uint16(ln.rec)
+	cmd.usage = UsageModel
 	cmd.typ = MarginTypeSet
 	cmd.payload = SetClearErrorLog
 	if err := ln.lmrCmdRspEcho(&cmd); err != nil {
-		return point, err
+		return err
 	}
 	cmd.payload = SetGoToNormalSettings
-	if err := ln.lmrCmdRspEcho(&cmd); err != nil {
-		return point, err
+	return ln.lmrCmdRspEcho(&cmd)
+}
+
+// pointOcpName returns the signed offset of point for the OCP subcomponent
+// location, e.g. "T:+0.250000UI" or "V:-0.100000V". The sign is omitted when
+// the direction is not independent. It returns "" for an unknown direction.
+func pointOcpName(point *lmtpb.LinkMargin_Lane_MarginPoint) string {
+	switch point.GetDirection() {
+	case lmtpb.LinkMargin_Lane_MarginPoint_D_UP:
+		return fmt.Sprintf("V:+%fV", point.GetVoltage())
+	case lmtpb.LinkMargin_Lane_MarginPoint_D_DOWN:
+		return fmt.Sprintf("V:-%fV", point.GetVoltage())
+	case lmtpb.LinkMargin_Lane_MarginPoint_D_UD:
+		return fmt.Sprintf("V:%fV", point.GetVoltage())
+	case lmtpb.LinkMargin_Lane_MarginPoint_D_RIGHT:
+		return fmt.Sprintf("T:+%fUI", point.GetPercentUi())
+	case lmtpb.LinkMargin_Lane_MarginPoint_D_LEFT:
+		return fmt.Sprintf("T:-%fUI", point.GetPercentUi())
+	case lmtpb.LinkMargin_Lane_MarginPoint_D_LR:
+		return fmt.Sprintf("T:%fUI", point.GetPercentUi())
+	default:
+		return ""
 	}
-	return point, nil
+}
+
+// unitName returns the OCP measurement unit of point, which holds its step,
+// direction and voltage or timing offset, e.g.
+// "Unit=UI;Step=005;Dir=RIGHT   ;Offset=0.250".
+func unitName(point *lmtpb.LinkMargin_Lane_MarginPoint, t *aspect) string {
+	if t.VnotT {
+		return fmt.Sprintf("Unit=V;Step=%03d;Dir=%-8s;Offset=%6.4f",
+			point.GetSteps(), strings.TrimPrefix(point.GetDirection().String(), "D_"), point.GetVoltage())
+	}
+	return fmt.Sprintf("Unit=UI;Step=%03d;Dir=%-8s;Offset=%5.3f",
+		point.GetSteps(), strings.TrimPrefix(point.GetDirection().String(), "D_"), point.GetPercentUi())
 }

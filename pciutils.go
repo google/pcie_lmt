@@ -32,6 +32,8 @@ import (
 	"fmt"
 	"os"
 	"path"
+	"regexp"
+	"strconv"
 	"sync"
 
 	log "github.com/golang/glog"
@@ -44,23 +46,33 @@ type Dev struct {
 
 // PCIDevInfo struct is used to export C.struct_pci_dev members.
 type PCIDevInfo struct {
-	VendorID, DeviceID, Domain uint16
-	Bus, Dev, Func             uint8
-	HdrType                    int32
+	VendorID, DeviceID uint16
+	// Domain is the full PCI domain, which can exceed 16 bits, e.g. Intel VMD
+	// domains start at 0x10000.
+	Domain         int32
+	Bus, Dev, Func uint8
+	HdrType        int32
 }
 
 // GetDevInfo fills a PCIDevInfo from a Dev, as Dev members are not exported.
+// It must not lock m, because BDFString calls it while m is held.
 func (dev Dev) GetDevInfo() PCIDevInfo {
 	info := PCIDevInfo{
 		VendorID: uint16(dev.cptr.vendor_id),
 		DeviceID: uint16(dev.cptr.device_id),
-		Domain:   uint16(dev.cptr.domain_16),
-		Bus:      uint8(dev.cptr.bus),
-		Dev:      uint8(dev.cptr.dev),
-		Func:     uint8(dev.cptr._func),
-		HdrType:  int32(dev.cptr.hdrtype),
+		// domain_16 is clamped to 0xffff for domains wider than 16 bits.
+		Domain:  int32(dev.cptr.domain),
+		Bus:     uint8(dev.cptr.bus),
+		Dev:     uint8(dev.cptr.dev),
+		Func:    uint8(dev.cptr._func),
+		HdrType: int32(dev.cptr.hdrtype),
 	}
 	return info
+}
+
+// BDFStr gets the device's BDF as a string, e.g. "0000:16:00.0".
+func (d PCIDevInfo) BDFStr() string {
+	return fmt.Sprintf("%04x:%02x:%02x.%d", d.Domain, d.Bus, d.Dev, d.Func)
 }
 
 // Access exports the pciutils' access instance.
@@ -68,6 +80,8 @@ var Access *C.struct_pci_access
 
 // Only one goroutine can call pciutils at a time, because it's not thread-safe.
 var m sync.Mutex
+
+var sysfsDevicesDir = "/sys/bus/pci/devices"
 
 // WriteByte exports pciutils.pci_write_byte().
 func WriteByte(dev Dev, addr int32, val uint8) {
@@ -111,7 +125,7 @@ func ReadLong(dev Dev, addr int32) uint32 {
 	return uint32(C.pci_read_long(dev.cptr, C.int(addr)))
 }
 
-// GetNext exports the next pointer of a Deva.
+// GetNext exports the next pointer of a Dev.
 func (dev Dev) GetNext() Dev {
 	return Dev{cptr: dev.cptr.next}
 }
@@ -156,24 +170,54 @@ func ScanDevices() Dev {
 	return Dev{cptr: devs}
 }
 
+// bdfRE matches a PCI device name in the sysfs format, e.g. "0000:15:01.0".
+// The domain can be wider than 4 hex digits, e.g. Intel VMD domains start at
+// 0x10000.
+var bdfRE = regexp.MustCompile(`^([0-9a-fA-F]{1,8}):([0-9a-fA-F]{1,2}):([0-9a-fA-F]{1,2})\.([0-7])$`)
+
+// ParseBDF parses a PCI device name in the sysfs format, e.g. "0000:15:01.0".
+// It rejects trailing input and out-of-range fields: the domain must fit in an
+// int32, and the device number must be at most 0x1f.
+func ParseBDF(name string) (domain, bus, dev, fn int, err error) {
+	m := bdfRE.FindStringSubmatch(name)
+	if len(m) == 0 {
+		return 0, 0, 0, 0, fmt.Errorf("%q is not a BDF in the DDDD:BB:dd.f format", name)
+	}
+	// The regexp bounds the bus to 0xff and the function to 7.
+	d, err := strconv.ParseUint(m[1], 16, 31)
+	if err != nil {
+		return 0, 0, 0, 0, fmt.Errorf("domain of %q out of range: %w", name, err)
+	}
+	v, err := strconv.ParseUint(m[3], 16, 5)
+	if err != nil {
+		return 0, 0, 0, 0, fmt.Errorf("device of %q out of range: %w", name, err)
+	}
+	b, _ := strconv.ParseUint(m[2], 16, 8)
+	f, _ := strconv.ParseUint(m[4], 10, 3)
+	return int(d), int(b), int(v), int(f), nil
+}
+
 // FindDSP identifies the downstream port (DSP) of an upstream port (USP).
 func (dev Dev) FindDSP() (Dev, error) {
 	m.Lock()
 	defer m.Unlock()
 	devName := dev.BDFString()
-	devPath := path.Join("/sys/bus/pci/devices", devName)
+	devPath := path.Join(sysfsDevicesDir, devName)
 	dspPath, err := os.Readlink(devPath)
 	if err != nil {
-		log.Errorf("Failed accessing the device path: %s. Error: %s", devPath, err.Error())
+		log.Errorf("BDF[%s]: Failed accessing the device path: %s. Error: %s", devName, devPath, err.Error())
 		return Dev{}, err
 	}
 	dspName := path.Base(path.Dir(dspPath))
-	var domain, b, d, f C.int
-	if n, err := fmt.Sscanf(dspName, "%04x:%02x:%02x.%d", &domain, &b, &d, &f); err != nil || n != 4 {
-		log.Errorf("Failed parsing DSP BDF: %s. Error: %s", dspName, err.Error())
+	domain, b, d, f, err := ParseBDF(dspName)
+	if err != nil {
+		log.Errorf("BDF[%s]: Failed parsing DSP BDF: %s. Error: %v", devName, dspName, err)
 		return Dev{}, err
 	}
-	dsp := C.pci_get_dev(Access, domain, b, d, f)
+	dsp := C.pci_get_dev(Access, C.int(domain), C.int(b), C.int(d), C.int(f))
+	// pci_get_dev() only allocates the device with its BDF. Without filling in
+	// the identity, the vendor and device IDs read back as 0.
+	C.pci_fill_info(dsp, C.PCI_FILL_IDENT)
 	return Dev{cptr: dsp}, nil
 }
 
@@ -188,12 +232,34 @@ func (dev Dev) GetUSP() Dev {
 	return Dev{cptr: C.pci_get_dev(Access, 0, C.int(bus), 0, 0)}
 }
 
-// BDFString gets a device's BDF as a string.
+// BDFString gets a device's BDF as a string, or "invalid" if dev is not a valid device.
 func (dev Dev) BDFString() string {
+	if dev.cptr == nil {
+		return "invalid"
+	}
 	return fmt.Sprintf("%04x:%02x:%02x.%d", dev.cptr.domain, dev.cptr.bus, dev.cptr.dev, dev.cptr._func)
+}
+
+// devAt returns a Dev with only its BDF filled in, for tests. It has no access to the config space.
+func devAt(domain int, bus, dev, fn uint8) Dev {
+	return Dev{cptr: &C.struct_pci_dev{domain: C.int(domain), bus: C.u8(bus), dev: C.u8(dev), _func: C.u8(fn)}}
 }
 
 // Valid returns whether Dev represents a valid device.
 func (dev Dev) Valid() bool {
 	return dev.cptr != nil
+}
+
+// FindCapability searches the PCI device's capability list for a capability with the given ID.
+// capType specifies whether it is a conventional PCI capability (C.PCI_CAP_NORMAL) or a PCIe extended capability (C.PCI_CAP_EXTENDED).
+// It returns the offset of the capability structure.
+func FindCapability(dev Dev, capID uint16, capType uint32) (int32, error) {
+	m.Lock()
+	defer m.Unlock()
+
+	capPtr := C.pci_find_cap(dev.cptr, C.uint(capID), C.uint(capType))
+	if capPtr == nil {
+		return 0, fmt.Errorf("PCI capability 0x%x (type %d) not found on device %s", capID, capType, dev.BDFString())
+	}
+	return int32(capPtr.addr), nil
 }

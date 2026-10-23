@@ -24,19 +24,42 @@ message LinkTrainTests {
   repeated LinkTrain link_train = 1;
 }
 
+// Identifies a PCIe link by the PCI <vendor_id, device_id> and the BDFs of
+// both of its ends, which disambiguates links whose USPs share the same IDs,
+// e.g. a NIC whose internal downstream port has the same IDs as its external
+// upstream port, or a switch whose ports all share the same IDs.
+// All set fields are ANDed. An unset field is a wildcard that matches any
+// value. The IDs are 16-bit PCI IDs; protobuf has no uint16 type.
+message PcieLinkTarget {
+  optional uint32 usp_vendor_id = 1;
+  optional uint32 usp_device_id = 2;
+  // The link's USP must be one of these BDFs, in the format of
+  // "0000:00:00.0". An empty list is a wildcard. A malformed BDF is an error.
+  repeated string usp_bdfs = 3;
+  optional uint32 dsp_vendor_id = 4;
+  optional uint32 dsp_device_id = 5;
+  // The link's DSP must be one of these BDFs, in the format of
+  // "0000:00:00.0". An empty list is a wildcard. A malformed BDF is an error.
+  repeated string dsp_bdfs = 6;
+}
+
 message LinkTrain {
-  // The following optional fields are use to select PCIe Upstream Port (USP)
-  // in the system to conduct the link training test.
-  // USPs can be chosen by vendor and device IDs.
-  optional uint32 vendor_id = 1;
-  optional uint32 device_id = 2;
+  // The former USP filters vendor_id = 1, device_id = 2 and bdf = 3, replaced
+  // by link_target. Only the numbers are reserved, not the names: Go prototext
+  // and C++ TextFormat silently skip a reserved field name, so a spec that
+  // still sets a legacy filter would silently lose it, and could select every
+  // link, instead of failing to parse.
+  reserved 1, 2, 3;
 
-  // USPs can also be chosen by BDFs in the format of "0000:00:00.0".
-  repeated string bdf = 3;
-
-  // USP and DSP's BDF, where secondary bus reset is issued.
+  // Output only. The BDFs of the USP and the DSP of the tested link, where
+  // secondary bus reset is issued.
   optional string usp_bdf = 4;
   optional string dsp_bdf = 5;
+
+  // Selects the links to test by the IDs and the BDFs of both of their ends.
+  // An unset field is a wildcard; an unset link_target selects every link.
+  optional PcieLinkTarget link_target = 20;
+
   int32 iterations = 6;  // number of link training iterations
 
   optional int32 pass_count = 7;  // number of successful link training
@@ -50,12 +73,17 @@ message LinkTrain {
     M_RETRAIN_DEFAULT = 0;  // Link Retrain, the default
     M_SBR = 1;              // Secondary Bus Reset
     M_REENABLE = 2;         // Link disable and re-enable
+    M_RETRAIN_WITH_EQ = 3;  // Link Retrain with Perform Equalization bit set
   }
 
   Method method = 10;
 
   // Wait time per training iteration in ms, normally 100ms for all methods.
   uint32 training_wait_ms = 11;
+
+  // Wait time after disable polling finished in ms before enabling the link.
+  // This is only used for M_REENABLE.
+  uint32 reenable_wait_ms_after_disable = 18;
 
   // Only when set to true, test each link in parallel, otherwise, in series.
   optional bool parallel = 12;
@@ -97,4 +125,17 @@ message LinkTrain {
   }
 
   repeated PciConfigField field = 15;
+  // If this field is true, we dynamically add S_RECOVER PciConfigField to
+  // recover the first 0x40 bytes of the config space, which is the
+  // PCI-Compatible Config Space Header according to Spec 7.2 or 7.5.1.1.
+  bool recover_pci_config_space_header = 16;
+  // If this field is set to true, we dynamically adds S_RECOVER PciConfigField
+  // to recover all control registers in the PCIe Capability Structure defined
+  // in Spec 7.5.3.
+  bool recover_pcie_cap_ctrl_regs = 17;
+  // Whether to automatically search for and recover the SR-IOV capability
+  // structure registers. When true, dynamically adds S_RECOVER PciConfigField
+  // to recover all 16 DWORDs (64 bytes) in the SR-IOV Extended Capability
+  // Structure defined in PCIe Spec 6.4 Section 9.4.
+  bool recover_sriov_cap_regs = 19;
 }

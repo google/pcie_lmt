@@ -114,6 +114,17 @@ func (ln *Lane) Init(
 	}
 }
 
+// laneRepr returns a formatted string identifying the BDF, Receiver, and Lane.
+func (ln *Lane) laneRepr() string {
+	bdfStr := "invalid"
+	if ln.dev.Valid() {
+		bdfStr = ln.dev.BDFString()
+	}
+	rxStr := strings.TrimPrefix(ln.rec.String(), "R_")
+	laneNum := ln.laneNumber
+	return fmt.Sprintf("BDF[%s]; Rx[%s]; Lane[%d]", bdfStr, rxStr, laneNum)
+}
+
 const (
 	// MaxTimingOffset is between 20 and 50; default to the max.
 	defaultMaxTimingOffset = 50
@@ -147,14 +158,9 @@ type aspect struct {
 
 // MarginLane performs series of margining at steps.
 func (ln *Lane) MarginLane() error {
-	var msg strings.Builder
-	defer func() {
-		ln.msg = msg.String()
-	}()
-
 	// Reads Lane parameters
 	if err := ln.readLaneParameters(); err != nil {
-		log.Errorf("Failed to read lane parameters for lane %d: %v", ln.laneNumber, err)
+		log.Errorf("%s: Failed to read lane parameters: %v", ln.laneRepr(), err)
 		ln.rxwg.Done()
 		return err
 	}
@@ -164,13 +170,26 @@ func (ln *Lane) MarginLane() error {
 	ln.rxwg.Wait()
 	ln.linkwg.Wait()
 
+	return ln.marginAspects(func() {})
+}
+
+// marginAspects margins the timing and/or voltage aspects of the lane in order, once its
+// parameters are read. It calls endTurn after each margin point. It must not wait on other lanes,
+// e.g. on rxwg or linkwg: marginInTurn runs the lanes as coroutines, one at a time, so such a wait
+// deadlocks the round robin.
+func (ln *Lane) marginAspects(endTurn func()) error {
+	var msg strings.Builder
+	defer func() {
+		ln.msg = msg.String()
+	}()
+
 	aspects := ln.prepareMarginTests(&msg)
 
 	// Executes the prepared test specs.
 	for i := range aspects {
-		if err := ln.testAspect(&aspects[i], &msg); err != nil {
+		if err := ln.testAspect(&aspects[i], &msg, endTurn); err != nil {
 			// Log error and continue to next test type if desired, or return error to stop all tests.
-			log.Errorf("Error executing test for lane %d: %v", ln.laneNumber, err)
+			log.Errorf("%s: Error executing test: %v", ln.laneRepr(), err)
 			return err
 		}
 	}
@@ -277,7 +296,7 @@ func (ln *Lane) readLaneParameters() error {
 	}
 	data, err := opt.Marshal(param)
 	if err != nil {
-		log.Errorf("pbj.Marshal(%v) failed: %v", data, err)
+		log.Errorf("%s: pbj.Marshal(%v) failed: %v", ln.laneRepr(), data, err)
 		return err
 	}
 
@@ -334,26 +353,30 @@ func (ln *Lane) prepareMarginTests(msg *strings.Builder) []aspect {
 	return aspects
 }
 
-// testAspect executes one test from the list.
-func (ln *Lane) testAspect(t *aspect, msg *strings.Builder) error {
+// testAspect executes one test from the list. It calls endTurn after each margin point.
+func (ln *Lane) testAspect(t *aspect, msg *strings.Builder, endTurn func()) error {
 	if t.spec.StartOffset == nil && t.spec.TargetOffset == nil && t.spec.EyeSize == nil {
-		log.Warningf("Lane %d: Test spec is empty, skipping", ln.laneNumber)
+		log.Warningf("%s: Test spec is empty, skipping", ln.laneRepr())
 		return nil
 	}
 
 	ln.calculateDwellTime(t)
+	ln.determineMarginRange(t)
 	ln.setupLaneValidators(t)
 	err := ln.setErrLimit(t, msg)
 	if err != nil {
 		return err
 	}
 
-	ln.determineMarginRange(t)
-
+	margin := func(offset uint16) (*lmtpb.LinkMargin_Lane_MarginPoint, error) {
+		mp, err := ln.margin(offset, t)
+		endTurn()
+		return mp, err
+	}
 	if t.eyeSizeMode {
-		ln.testEyeSize(t, msg)
+		testEyeSize(t, margin, msg)
 	} else {
-		ln.scanEye(t, msg)
+		scanEye(t, margin, msg)
 	}
 
 	ln.outputEyeMeasurement(t)
@@ -391,17 +414,17 @@ func (ln *Lane) calculateDwellTime(t *aspect) {
 	// Expected dwell is bitCount / sps
 	t.dwell = time.Duration(t.bitCount / t.sps * float64(time.Second))
 
-	log.V(1).Infof("Lane %d: Sample bit count = %f, SPS = %f, Calculated dwell = %s",
-		ln.laneNumber, t.bitCount, t.sps, t.dwell)
+	log.V(1).Infof("%s: Sample bit count = %f, SPS = %f, Calculated dwell = %s",
+		ln.laneRepr(), t.bitCount, t.sps, t.dwell)
 
 	// If greater dwell is specified, use that.
 	if t.spec.Dwell == nil || t.dwell > time.Duration(float64(*t.spec.Dwell)*float64(time.Second)) {
 		dwellSeconds := float32(t.dwell.Seconds())
 		t.spec.Dwell = &dwellSeconds
-		log.V(1).Infof("Lane %d: Using calculated dwell: %f seconds", ln.laneNumber, dwellSeconds)
+		log.V(1).Infof("%s: Using calculated dwell: %f seconds", ln.laneRepr(), dwellSeconds)
 	} else {
 		t.dwell = time.Duration(float64(*t.spec.Dwell) * float64(time.Second))
-		log.V(1).Infof("Lane %d: Using specified dwell: %f seconds", ln.laneNumber, *t.spec.Dwell)
+		log.V(1).Infof("%s: Using specified dwell: %f seconds", ln.laneRepr(), *t.spec.Dwell)
 	}
 }
 
@@ -419,7 +442,7 @@ func (ln *Lane) determineMarginRange(t *aspect) {
 	if t.spec.Step != nil {
 		t.step = uint16(t.spec.GetStep())
 		if t.step == 0 {
-			log.Warningf("Lane %d: step cannot be 0, adjusting to 1", ln.laneNumber)
+			log.Warningf("%s: step cannot be 0, adjusting to 1", ln.laneRepr())
 			t.step = 1
 		}
 	}
@@ -439,14 +462,14 @@ func (ln *Lane) determineMarginRange(t *aspect) {
 		} else {
 			t.target = 0
 		}
-		log.V(1).Infof("Lane %d: EyeSizeMode: size=%d steps, target=%d, step=%d", ln.laneNumber, t.start, t.target, t.step)
+		log.V(1).Infof("%s: EyeSizeMode: size=%d steps, target=%d, step=%d", ln.laneRepr(), t.start, t.target, t.step)
 		return
 	}
 
 	if t.spec.TargetOffset != nil {
 		// Set the target max offset to be no greater than the Lane's capability.
 		if t.spec.GetTargetOffset() > t.steps {
-			log.Warningf("Lane %d: target_offset %d exceeds capability %d, adjusting", ln.laneNumber, *t.spec.TargetOffset, t.steps)
+			log.Warningf("%s: target_offset %d exceeds capability %d, adjusting", ln.laneRepr(), *t.spec.TargetOffset, t.steps)
 			*t.spec.TargetOffset = t.steps
 		}
 		t.target = uint16(t.spec.GetTargetOffset())
@@ -463,13 +486,13 @@ func (ln *Lane) determineMarginRange(t *aspect) {
 		t.start = uint16(*t.spec.StartOffset)
 		// Step, if specified, must be no greater than the target.
 		if t.start > t.target {
-			log.Warningf("Lane %d: start_offset %d > target_offset %d, adjusting start = target", ln.laneNumber, t.start, t.target)
+			log.Warningf("%s: start_offset %d > target_offset %d, adjusting start = target", ln.laneRepr(), t.start, t.target)
 			t.start = t.target
 		}
 	} else {
 		t.start = t.target
 	}
-	log.V(1).Infof("Lane %d: Margin range: start=%d, target=%d, step=%d, untilFail=%v", ln.laneNumber, t.start, t.target, t.step, t.untilFail)
+	log.V(1).Infof("%s: Margin range: start=%d, target=%d, step=%d, untilFail=%v", ln.laneRepr(), t.start, t.target, t.step, t.untilFail)
 }
 
 // setupLaneValidators sets up OCP validators for status and BER.
@@ -505,152 +528,106 @@ func (ln *Lane) setupLaneValidators(t *aspect) {
 	}
 }
 
+// marginFunc margins a lane at an offset, which includes the direction bit.
+type marginFunc func(offset uint16) (*lmtpb.LinkMargin_Lane_MarginPoint, error)
+
+// marginAt margins at the offset, appends any error to msg, and reports whether the point passes.
+func marginAt(margin marginFunc, offset uint16, msg *strings.Builder) (*lmtpb.LinkMargin_Lane_MarginPoint, bool) {
+	mp, err := margin(offset)
+	if err != nil {
+		msg.WriteString(err.Error() + " | ")
+	}
+	return mp, mp.GetStatus() == lmtpb.LinkMargin_Lane_MarginPoint_S_MARGINING
+}
+
+// record stores mp as the passing or failing point on the side (pos or neg), overwriting any
+// previous one. Callers that must keep the first failing point (scanEye) check t.mp[side][fail]
+// before calling it.
+func (t *aspect) record(side int, mp *lmtpb.LinkMargin_Lane_MarginPoint, passed bool) {
+	pf := fail
+	if passed {
+		pf = pass
+	}
+	t.mp[side][pf] = mp
+}
+
 // scanEye iterates through margin offsets to find the pass/fail boundaries.
-func (ln *Lane) scanEye(t *aspect, msg *strings.Builder) {
-	var err error
+func scanEye(t *aspect, margin marginFunc, msg *strings.Builder) {
 	for offset := t.start; ; {
 		// Steps until either target offset is reached or neither side is passing
 		passPos := false
-		passNeg := false
 		var mp *lmtpb.LinkMargin_Lane_MarginPoint
 
 		// Too many errors causes link recoveries, so stop further offsets once failed.
 		// Theoretically, IndErrorSampler avoids it. However, it's not true on some retimer devices.
 		if t.mp[pos][fail] == nil {
-			if mp, err = ln.margin(offset, t); err != nil {
-				msg.WriteString(err.Error() + " | ")
-			}
-
-			passPos = mp.GetStatus() == lmtpb.LinkMargin_Lane_MarginPoint_S_MARGINING
-			if passPos {
-				if t.mp[pos][fail] == nil { // if not yet found a fail point, store the pass point
-					t.mp[pos][pass] = mp
-				}
-			} else {
-				if t.mp[pos][fail] == nil {
-					t.mp[pos][fail] = mp
-				}
-			}
+			mp, passPos = marginAt(margin, offset, msg)
+			t.record(pos, mp, passPos)
 		}
 
-		passNeg = passPos
-		// if independent left/right or up/down, tests the negative side.
-		if t.indDir {
-			// Too many errors causes link recoveries, so stop further offsets once failed.
-			// Theoretically, IndErrorSampler avoids it. However, it's not true on some retimer devices.
-			if t.mp[neg][fail] == nil {
-
-				if mp, err = ln.margin(offset|t.dirmask, t); err != nil {
-					msg.WriteString(err.Error() + " | ")
-				}
-
-				passNeg = mp.GetStatus() == lmtpb.LinkMargin_Lane_MarginPoint_S_MARGINING
+		passNeg := passPos
+		if t.mp[neg][fail] == nil { // if not yet found a fail point, store the point
+			if t.indDir { // if independent left/right or up/down, tests the negative side.
+				mp, passNeg = marginAt(margin, offset|t.dirmask, msg)
 			}
-		}
-		if passNeg {
-			if t.mp[neg][fail] == nil { // if not yet found a fail point, store the pass point
-				t.mp[neg][pass] = mp
-			}
-		} else {
-			if t.mp[neg][fail] == nil {
-				t.mp[neg][fail] = mp
-			}
+			t.record(neg, mp, passNeg)
 		}
 
-		if offset >= t.target {
+		if offset >= t.target || (t.untilFail && !passPos && !passNeg) {
 			break
-		} else if t.untilFail && !passPos && !passNeg {
-			break
-		} else {
-			offset += uint16(t.step)
-			// Makes sure target is margined in the end.
-			if offset > t.target {
-				offset = t.target
-			}
+		}
+		offset += t.step
+		// Makes sure target is margined in the end.
+		if offset > t.target {
+			offset = t.target
 		}
 	}
 }
 
 // testEyeSize checks if the eye size meets the spec even if it's off-centered.
-func (ln *Lane) testEyeSize(t *aspect, msg *strings.Builder) {
-	var err error
+// Under the eye size mode, t.start is the required eye size in steps.
+func testEyeSize(t *aspect, margin marginFunc, msg *strings.Builder) {
+	offset := t.start - t.start/2 // Start from positive half of the eye size rounding up.
 
-	passPos := false
-	passNeg := false
-
-	var mp *lmtpb.LinkMargin_Lane_MarginPoint
-	offset := t.start / 2 // Under the checkEyeSize mode, start is the required eye size in steps.
-
-RedoPos: // Redo the positive offset if the eye center is more positive.
-	for offset = t.start - offset; ; { // Start from positive half of the eye size rounding up.
-		// margin at offset downwards towards the positive target, or if passing.
-		if mp, err = ln.margin(offset, t); err != nil {
-			msg.WriteString(err.Error() + " | ")
-		}
-		passPos = mp.GetStatus() == lmtpb.LinkMargin_Lane_MarginPoint_S_MARGINING
-
-		// If independent left/right or up/down not supported, the test is done, as no off-centeredness.
-		if !t.indDir {
-			passNeg = passPos
-			if passPos {
-				t.mp[pos][pass] = mp
-				t.mp[neg][pass] = mp
-			} else {
-				t.mp[pos][fail] = mp
-				t.mp[neg][fail] = mp
-			}
-			return
-		}
-
-		if passPos {
-			t.mp[pos][pass] = mp
-			break // move to the negative half if the positive passing offset is found.
-		}
-
-		t.mp[pos][fail] = mp // record the smallest failing offset.
-
-		if offset <= t.target {
-			break // when all failing, end the scan at the target offset.
-		}
-		offset -= uint16(t.step)
-		if offset < t.target {
-			offset = t.target // when all failing, always test the target offset.
-		}
-	}
-
-	if passNeg { // Only when RedoPos, passNeg is true.
+	// If independent left/right or up/down not supported, the test is done, as no off-centeredness.
+	if !t.indDir {
+		mp, passed := marginAt(margin, offset, msg)
+		t.record(pos, mp, passed)
+		t.record(neg, mp, passed)
 		return
 	}
 
+	offset, passPos := scanInwards(t, margin, pos, offset, msg)
 	// Even when the positive target fails, still get some measurement on the negative side, even
-	// though the eye size check already failed.
-	for offset = t.start - offset; ; { // Start from eye_size - positive passing offset.
-		// margin at negative offset upwards towards the negative target, or if passing.
-		if mp, err = ln.margin(offset|t.dirmask, t); err != nil {
-			msg.WriteString(err.Error() + " | ")
-		}
-		passNeg = mp.GetStatus() == lmtpb.LinkMargin_Lane_MarginPoint_S_MARGINING
-
-		if passNeg {
-			t.mp[neg][pass] = mp
-			break
-		}
-
-		t.mp[neg][fail] = mp // record the smallest failing offset.
-
-		if offset <= t.target {
-			break // when all failing, end the scan at the target offset.
-		}
-		offset -= uint16(t.step)
-		if offset < t.target {
-			offset = t.target // when all failing, always test the target offset.
-		}
-	}
+	// though the eye size check already failed. Start from eye_size - positive passing offset.
+	offset, passNeg := scanInwards(t, margin, neg, t.start-offset, msg)
 
 	// If positive scan never fails, and the negative scan is smaller the eye_size/2,
 	// the eye center may be more positive. Redo the positive scan starting from bigger offset.
 	if passPos && passNeg && t.mp[pos][fail] == nil && t.mp[neg][fail] != nil {
-		goto RedoPos
+		scanInwards(t, margin, pos, t.start-offset, msg)
+	}
+}
+
+// scanInwards margins one side of the eye from offset down towards t.target, until a point passes
+// or the target is margined. It records the passing point or the smallest failing point, and
+// returns the last margined offset and whether it passed.
+func scanInwards(t *aspect, margin marginFunc, side int, offset uint16, msg *strings.Builder) (uint16, bool) {
+	var dir uint16
+	if side == neg {
+		dir = t.dirmask
+	}
+	for {
+		mp, passed := marginAt(margin, offset|dir, msg)
+		t.record(side, mp, passed)
+		if passed || offset <= t.target {
+			return offset, passed
+		}
+		if offset < t.target+t.step {
+			offset = t.target // when all failing, always test the target offset.
+		} else {
+			offset -= t.step
+		}
 	}
 }
 

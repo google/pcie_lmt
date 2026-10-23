@@ -1,0 +1,53 @@
+# Copyright 2023 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: CI
+
+on:
+  push:
+    branches:
+      - master
+      - main
+      - "test_**"
+  pull_request:
+    branches:
+      - master
+      - main
+
+jobs:
+  build-and-test:
+    name: build-and-test
+    runs-on: ubuntu-latest
+    env:
+      USE_BAZEL_VERSION: "7.5.0"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libpci-dev
+
+      - name: Build targets (static link)
+        run: bazel build //:lmt //ltt:ltt
+
+      - name: Run unit tests
+        run: bazel test --test_output=errors //...
+
+      - name: Build targets (dynamic link)
+        run: bazel build --define pci_link=dynamic //:lmt //ltt:ltt
+
+      - name: Build targets (linux_arm64_cgo cross-compile)
+        run: bazel build --platforms=@io_bazel_rules_go//go/toolchain:linux_arm64_cgo //:lmt //ltt:ltt

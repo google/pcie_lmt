@@ -31,6 +31,7 @@ import (
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"slices"
@@ -95,6 +96,8 @@ type receiver struct {
 	rxwg      *sync.WaitGroup // To sync the receiver port.
 	linkwg    *sync.WaitGroup // Sometimes, the receiver needs to wait for other links.
 	hwinfo    string          // OCP hardware_info_id
+	// marginHooks are called after each margin point of the receiver lanes.
+	marginHooks []MarginHook
 }
 
 var (
@@ -107,6 +110,8 @@ var (
 	testRunStart *ocppb.TestRunStart
 	// testRunEnd tracks the OCP TestStatus and TestResult
 	testRunEnd *ocppb.TestRunEnd
+
+	pciScanDevices = pci.ScanDevices
 )
 
 // OcpInit initializes the OCP output headers.
@@ -155,19 +160,11 @@ func ReadLinkMargin(fn string, isJSON bool) (*lmtpb.LinkMargin, error) {
 	// Allocate a new PciConfigField to hold the deserialized proto.
 	cfg := &lmtpb.LinkMargin{}
 	if isJSON {
-		opt := protojson.UnmarshalOptions{
-			AllowPartial:   false,
-			DiscardUnknown: true,
-		}
-		if err := opt.Unmarshal(data, cfg); err != nil {
+		if err := protojson.Unmarshal(data, cfg); err != nil {
 			return nil, err
 		}
 	} else {
-		opt := prototext.UnmarshalOptions{
-			AllowPartial:   false,
-			DiscardUnknown: true,
-		}
-		if err := opt.Unmarshal(data, cfg); err != nil {
+		if err := prototext.Unmarshal(data, cfg); err != nil {
 			return nil, err
 		}
 	}
@@ -218,11 +215,15 @@ func WriteResultPbtxt(outfn string) error {
 // MarginLinks is the top-level test function.
 // It identifies links to be tested and tests them in parallel.
 func MarginLinks(cfg *lmtpb.LinkMargin) error {
+	if err := validateLinkTarget(cfg.GetLinkTarget()); err != nil {
+		return err
+	}
+
 	pci.Init()
 	defer pci.Cleanup()
 
 	// Gets a list of PCI devices.
-	devs := pci.ScanDevices()
+	devs := pciScanDevices()
 	if !devs.Valid() {
 		err := fmt.Errorf("no pcie devices found")
 		return err
@@ -398,6 +399,94 @@ func ocpTestRunStart(cfg *lmtpb.LinkMargin) {
 // This is global, rather than per link, because of bifurcation consideration. All links are synced.
 var linkwg sync.WaitGroup
 
+// matchID reports whether a PCI ID matches want. A nil want is a wildcard.
+func matchID(want *uint32, got uint16) bool {
+	return want == nil || *want == uint32(got)
+}
+
+// matchBDF reports whether the device is one of bdfs. An empty bdfs is a
+// wildcard. BDFs are compared numerically, so e.g. "0000:B8:00.0" matches the
+// device 0000:b8:00.0. Malformed BDFs, which validateLinkTarget rejects before
+// the scan, never match.
+func matchBDF(bdfs []string, d pci.PCIDevInfo) bool {
+	if len(bdfs) == 0 {
+		return true
+	}
+	for _, bdf := range bdfs {
+		domain, bus, dev, fn, err := pci.ParseBDF(bdf)
+		if err != nil {
+			log.Warningf("Failed to parse BDF %q: %v", bdf, err)
+			continue
+		}
+		if domain == int(d.Domain) && bus == int(d.Bus) && dev == int(d.Dev) && fn == int(d.Func) {
+			return true
+		}
+	}
+	return false
+}
+
+// validateLinkTarget returns an error if any BDF in the link target is
+// malformed, so that a typo fails the test instead of silently matching
+// nothing.
+func validateLinkTarget(target *lmtpb.PcieLinkTarget) error {
+	for _, bdf := range slices.Concat(target.GetUspBdfs(), target.GetDspBdfs()) {
+		if _, _, _, _, err := pci.ParseBDF(bdf); err != nil {
+			return fmt.Errorf("malformed BDF %q in link_target: %w", bdf, err)
+		}
+	}
+	return nil
+}
+
+// OverrideUSPBDFs replaces the USP BDF filter of cfg with bdfs, e.g. from a
+// command line flag.
+//
+// Surrounding whitespace is trimmed from each entry and empty entries are
+// dropped, so e.g. strings.Split("0000:16:00.0,", ",") selects one USP. It
+// returns an error and leaves cfg unchanged if cfg is nil, if any entry is
+// malformed, or if no entry is left, because an empty filter would select every
+// link.
+func OverrideUSPBDFs(cfg *lmtpb.LinkMargin, bdfs []string) error {
+	if cfg == nil {
+		return errors.New("nil LinkMargin config")
+	}
+	var usp []string
+	for _, bdf := range bdfs {
+		bdf = strings.TrimSpace(bdf)
+		if bdf == "" {
+			continue
+		}
+		if _, _, _, _, err := pci.ParseBDF(bdf); err != nil {
+			return fmt.Errorf("malformed USP BDF: %w", err)
+		}
+		usp = append(usp, bdf)
+	}
+	if len(usp) == 0 {
+		return fmt.Errorf("no valid USP BDF given (input: %q)", bdfs)
+	}
+	if cfg.LinkTarget == nil {
+		cfg.LinkTarget = &lmtpb.PcieLinkTarget{}
+	}
+	cfg.LinkTarget.UspBdfs = usp
+	return nil
+}
+
+// matchLinkTarget reports whether the link between the given USP and DSP
+// matches the link target. The USP BDFs are not checked here, and the USP IDs
+// are checked again only for completeness, because getLinks checks both before
+// looking up the DSP.
+//
+// A nil target, or an unset field within the target, is a wildcard.
+func matchLinkTarget(uspInfo, dspInfo pci.PCIDevInfo, target *lmtpb.PcieLinkTarget) bool {
+	if target == nil {
+		return true
+	}
+	return matchID(target.UspVendorId, uspInfo.VendorID) &&
+		matchID(target.UspDeviceId, uspInfo.DeviceID) &&
+		matchID(target.DspVendorId, dspInfo.VendorID) &&
+		matchID(target.DspDeviceId, dspInfo.DeviceID) &&
+		matchBDF(target.GetDspBdfs(), dspInfo)
+}
+
 // getLinks gets a list of PCIe ports according to the proto param.
 func getLinks(devs pci.Dev, cfg *lmtpb.LinkMargin) ([]*linktest, error) {
 	var err error
@@ -407,11 +496,17 @@ func getLinks(devs pci.Dev, cfg *lmtpb.LinkMargin) ([]*linktest, error) {
 	// This assumes dev number == 0, and func = 0.
 	for dev := devs; dev.Valid(); dev = dev.GetNext() {
 		d := dev.GetDevInfo()
-		vidChk := cfg.VendorId == nil || uint32(d.VendorID) == cfg.GetVendorId()
-		didChk := cfg.DeviceId == nil || uint32(d.DeviceID) == cfg.GetDeviceId()
-		bdfChk := len(cfg.GetBdf()) == 0 || slices.Contains(cfg.GetBdf(), fmt.Sprintf("%04x:%02x:%02x.%d", d.Domain, d.Bus, d.Dev, d.Func))
+		// Only tests the USPs that match the USP IDs and BDFs of link_target, if
+		// it is specified. A non-matching device is skipped here, before its
+		// config space is read and its DSP is looked up, so that an unrelated
+		// device cannot fail the run. The DSP fields are checked after the DSP is
+		// found below.
+		if t := cfg.GetLinkTarget(); t != nil &&
+			(!matchID(t.UspVendorId, d.VendorID) || !matchID(t.UspDeviceId, d.DeviceID) || !matchBDF(t.GetUspBdfs(), d)) {
+			continue
+		}
 		pf0Chk := (d.Dev == 0) && (d.Func == 0)
-		if vidChk && didChk && bdfChk && pf0Chk {
+		if pf0Chk {
 			// Checks the PCIe port type. Only an endpoint or a switch upstream port
 			// are eligible for margining.
 			if offset, err := getPcieCapOffset(dev); err != nil {
@@ -442,13 +537,24 @@ func getLinks(devs pci.Dev, cfg *lmtpb.LinkMargin) ([]*linktest, error) {
 			lt.dsp.isUSP = false
 			lt.usp.isUSP = true
 
+			// Dynamically filter out non-physical, internal Switch operational bridges.
+			// Base Class 0x06 (Bridge) in byte 0x0B, Sub-Class 0x80 (Other Bridge) in byte 0x0A.
+			if pci.ReadByte(lt.usp.dev, 0x0B) == 0x06 && pci.ReadByte(lt.usp.dev, 0x0A) == 0x80 {
+				log.Infof("[Notice] Dynamically skipping non-physical internal Switch bridge BDF %s based on PCI Sub-Class (0x06:0x80).",
+					dev.BDFString())
+				continue
+			}
+
+			// Both ends of the link must match link_target, if it is specified. This
+			// disambiguates links whose USPs share the same <vendor_id, device_id>.
+			if !matchLinkTarget(d, lt.dsp.dev.GetDevInfo(), cfg.GetLinkTarget()) {
+				log.Infof("BDF:[%s]: Skipping the link to DSP %s, which does not match link_target.",
+					dev.BDFString(), lt.dsp.dev.BDFString())
+				continue
+			}
+
 			// Clones a result protobuf for the test config protobuf.
 			lt.pb = proto.Clone(cfg).(*lmtpb.LinkMargin)
-			vendorID := uint32(d.VendorID)
-			lt.pb.VendorId = &vendorID
-			deviceID := uint32(d.DeviceID)
-			lt.pb.DeviceId = &deviceID
-			lt.pb.Bdf = ([]string{dev.BDFString()})
 			uspBdf := dev.BDFString()
 			lt.pb.UspBdf = &uspBdf
 			dspBdf := lt.dsp.dev.BDFString()
@@ -509,49 +615,65 @@ func getLinks(devs pci.Dev, cfg *lmtpb.LinkMargin) ([]*linktest, error) {
 // pciutils/ls-ecaps.c
 func (p *port) getLMRcapability() (int32, error) {
 	const (
-		ConfigSpace     = int32(0x1000)
-		CapabilityStart = int32(0x100)
-		CapabilityMask  = int32(0x00FF)
-		AddrMask        = int32(0x0FFC)
-		NextPos         = int(20)
+		ConfigSpace     = 0x1000
+		CapabilityStart = 0x100
+		CapabilityMask  = 0xFFFF
+		AddrMask        = 0x0FFC
+		NextPos         = 20
 	)
 	var been [ConfigSpace]bool
-	for addr := CapabilityStart; addr != 0; {
-		hdr := int32(pci.ReadLong(p.dev, addr))
+	for addr := int32(CapabilityStart); addr != 0; {
+		if addr&3 != 0 {
+			return 0, fmt.Errorf("Capability chain broken at 0x%x on device %s (unaligned pointer)", addr, p.dev.BDFString())
+		}
+		hdr := pci.ReadLong(p.dev, addr)
+		if hdr == 0xFFFFFFFF {
+			return 0, fmt.Errorf("Capability chain broken at 0x%x on device %s (read 0xFFFFFFFF)", addr, p.dev.BDFString())
+		}
+		// An empty header (0x0) indicates no extended capabilities or end of the capability list.
+		if hdr == 0 {
+			break
+		}
 		if (hdr & CapabilityMask) == C.PCI_EXT_CAP_ID_LMR {
 			return addr, nil
 		}
 		been[addr] = true
-		addr = (hdr >> NextPos) & AddrMask
+		addr = int32((hdr >> NextPos) & AddrMask)
 		if been[addr] {
-			return 0, fmt.Errorf("Capability chain loops at 0x%x", addr)
+			return 0, fmt.Errorf("Capability chain loops at 0x%x on device %s", addr, p.dev.BDFString())
 		}
 	}
-	return 0, fmt.Errorf("LMR capability header not found")
+	return 0, fmt.Errorf("LMR capability header not found on device %s", p.dev.BDFString())
 }
 
 // getPcieCapOffset scans the PCI capability linked list for PCIe CAP.
 // Refers to pciutils/ls-caps.c
 func getPcieCapOffset(dev pci.Dev) (int32, error) {
 	const (
-		ConfigSpace     = int32(0x100) // The base config space is 256B.
+		ConfigSpace     = 0x100 // The base config space is 256B.
 		CapabilityStart = C.PCI_CAPABILITY_LIST
-		CapabilityMask  = int32(0x00FF)
-		AddrMask        = int32(0x0FFC)
-		NextPos         = int(8)
+		CapabilityMask  = 0x00FF
+		AddrMask        = 0x00FC
+		NextPos         = 8
 	)
 	// Tracks if a loop occur in the linked list.
 	var been [ConfigSpace]bool
-	for addr := pci.ReadByte(dev, CapabilityStart); addr != 0; {
-		hdr := int32(pci.ReadWord(dev, int32(addr)))
-		if (hdr & CapabilityMask) == int32(C.PCI_CAP_ID_EXP) {
-			return int32(addr), nil
+	for addr := int32(pci.ReadByte(dev, CapabilityStart)); addr != 0; {
+		if addr&3 != 0 {
+			return 0, fmt.Errorf("Capability chain broken at 0x%x on device %s (unaligned pointer)", addr, dev.BDFString())
+		}
+		hdr := pci.ReadWord(dev, addr)
+		if hdr == 0xFFFF {
+			return 0, fmt.Errorf("Capability chain broken at 0x%x on device %s (read 0xFFFF)", addr, dev.BDFString())
+		}
+		if (hdr & CapabilityMask) == C.PCI_CAP_ID_EXP {
+			return addr, nil
 		}
 		been[addr] = true
-		addr = uint8((hdr >> NextPos) & AddrMask)
+		addr = int32((hdr >> NextPos) & AddrMask)
 		if been[addr] {
-			return 0, fmt.Errorf("Capability chain loops at 0x%x", addr)
+			return 0, fmt.Errorf("Capability chain loops at 0x%x on device %s", addr, dev.BDFString())
 		}
 	}
-	return 0, fmt.Errorf("PCIe capability header not found")
+	return 0, fmt.Errorf("PCIe capability header not found on device %s", dev.BDFString())
 }

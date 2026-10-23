@@ -46,95 +46,50 @@ import (
 func (lt *linktest) marginLink() {
 	lt.prepLink()
 	defer lt.restoreLink()
-	var err error
 	// Creates and initializes lanes under each receiver port, only when it's specified and
 	// ready to be tested.
 	// Collects only those lanes to be tested in an array slice.
 	cfg := lt.pb
 	// Reads if retimer presents
 	addr := lt.dsp.pcieCapOffset + C.PCI_EXP_LNKSTA2
-	val := pci.ReadWord(lt.dsp.dev, addr)
-	retimer0 := (val & C.PCI_EXP_LINKSTA2_RETIMER) != 0
-	retimer1 := (val & C.PCI_EXP_LINKSTA2_2RETIMERS) != 0
+	val := readWord(lt.dsp.dev, addr)
 	// Receiver ports and lanes initialization
 	for i := range lt.allRx {
-		// The index corresponds to the receiver number, where 0 is for broadcasting. not an actual
-		// receiver point. Only 1 to 6 are valid
-		if i == int(lmtpb.LinkMargin_R_BROADCAST0) ||
-			i == int(lmtpb.LinkMargin_R_RESERVED) {
-			lt.allRx[i] = nil
-			continue
-		}
-		// Skips retimer receivers if they are not detected
-		if (i == int(lmtpb.LinkMargin_R_RTU_B2) ||
-			i == int(lmtpb.LinkMargin_R_RTD_C3)) && !retimer0 {
-			lt.allRx[i] = nil
-			continue
-		}
-		if (i == int(lmtpb.LinkMargin_R_RTU_D4) ||
-			i == int(lmtpb.LinkMargin_R_RTD_E5)) && !retimer1 {
-			lt.allRx[i] = nil
-			continue
-		}
-
-		lt.allRx[i] = new(receiver)
-		rxpt := lt.allRx[i]
-		rxpt.testReady = false
-		// Converts the index to the receiver enum,
-		rxpt.rec = lmtpb.LinkMargin_ReceiverEnum(i)
-		// Other than the USP, all retimer and usp receivers run from the DSP port.
-		if rxpt.rec == lmtpb.LinkMargin_R_USP_F6 {
-			rxpt.port = lt.usp
-		} else {
-			rxpt.port = lt.dsp
-		}
-		rxpt.hwinfo = "BDF=" + rxpt.port.dev.BDFString() + ";RX=" + strings.TrimPrefix(rxpt.rec.String(), "R_")
-		rxpt.linkwg = lt.wg
-		rxpt.rxwg = new(sync.WaitGroup)
-		rxpt.lanes = make([]*Lane, rxpt.port.width, rxpt.port.width)
-		for i := range rxpt.lanes {
-			rxpt.lanes[i] = new(Lane)
-			rxpt.lanes[i].Init(lt.pb, rxpt.port.dev, i, rxpt.port.lmrAddr,
-				rxpt.rec, rxpt.port.speed, rxpt.rxwg, rxpt.linkwg, rxpt)
-		}
-		// Run lanes in parallel if the receiver lane has independent error sampler.
-		if rxpt.parallel, err = rxpt.lanes[0].GetIndErrorSampler(); err != nil {
-			message := lt.pb.GetMessage() + err.Error() + " | "
-			lt.pb.Message = &message
-		}
+		lt.allRx[i] = createReceiver(lt, lmtpb.LinkMargin_ReceiverEnum(i), val)
 	}
 
 	// Enlists the test specs from config.
 	for _, spec := range cfg.GetTestSpecs() {
 		if spec.GetReceiver() == lmtpb.LinkMargin_R_BROADCAST0 ||
 			spec.GetReceiver() == lmtpb.LinkMargin_R_RESERVED {
-			log.Warningf("Illegal test_specs receiver: %s. The test_spec is ignored.",
-				spec.GetReceiver().String())
+			log.Warningf("%s: Illegal test_specs receiver: %s. The test_spec is ignored.",
+				linkRepr(lt.usp.dev, spec.GetReceiver()), spec.GetReceiver().String())
 			continue
 		}
 
 		rxpt := lt.allRx[spec.GetReceiver()]
 		if rxpt == nil {
-			log.Warningf("The test_specs receiver: %s is not present on the link. The test_spec is ignored.",
-				spec.GetReceiver().String())
+			log.Warningf("%s: The test_specs receiver: %s is not present on the link. The test_spec is ignored.",
+				linkRepr(lt.usp.dev, spec.GetReceiver()), spec.GetReceiver().String())
 			continue
 		}
 
 		rxpt.testReady = true
 		if spec.GetAspect() != lmtpb.LinkMargin_M_VOLTAGE &&
 			spec.GetAspect() != lmtpb.LinkMargin_M_TIMING {
-			log.Warningf("The test_spec is missing the aspect (T or V). The test_spec is ignored.",
-				spec.GetReceiver().String())
+			log.Warningf("%s: The test_spec is missing the aspect (T or V). The test_spec is ignored.",
+				linkRepr(lt.usp.dev, spec.GetReceiver()))
 			rxpt.testReady = false
-		} else {
-			for n, lane := range rxpt.lanes {
-				if len(spec.GetLaneNumber()) == 0 || slices.Contains(spec.GetLaneNumber(), uint32(n)) {
-					if spec.GetAspect() == lmtpb.LinkMargin_M_VOLTAGE {
-						lane.Vspec = proto.Clone(spec).(*lmtpb.LinkMargin_TestSpec)
-					} else {
-						lane.Tspec = proto.Clone(spec).(*lmtpb.LinkMargin_TestSpec)
-					}
-				}
+			continue
+		}
+		for n, lane := range rxpt.lanes {
+			if len(spec.GetLaneNumber()) != 0 && !slices.Contains(spec.GetLaneNumber(), uint32(n)) {
+				continue
+			}
+			if spec.GetAspect() == lmtpb.LinkMargin_M_VOLTAGE {
+				lane.Vspec = proto.Clone(spec).(*lmtpb.LinkMargin_TestSpec)
+			} else {
+				lane.Tspec = proto.Clone(spec).(*lmtpb.LinkMargin_TestSpec)
 			}
 		}
 	}
@@ -143,7 +98,6 @@ func (lt *linktest) marginLink() {
 	lanes := make([]*lmtpb.LinkMargin_Lane, 0, maxRxPerLink*numLanes)
 	// Tests upstream lanes in parallel, followed by downstream lanes in parallel,
 	// with wait in between to avoid pcilib sysfs error
-	var wg sync.WaitGroup
 	linkcheck := true
 	for _, r := range lt.allRx {
 		if r == nil {
@@ -155,7 +109,7 @@ func (lt *linktest) marginLink() {
 		if !linkcheck {
 			continue
 		} // skip the rest of RX if link is no good.
-		log.V(1).Infoln("Margining lanes at receiver: ", r.rec.String())
+		log.V(1).Infof("%s: Margining lanes at receiver", r.rxRepr())
 
 		// OCP TestStepStart
 		stepStart := &ocppb.TestStepStart{
@@ -170,23 +124,7 @@ func (lt *linktest) marginLink() {
 		}
 		outputArtifact(outArti)
 
-		for _, ln := range r.lanes {
-			if ln.Vspec == nil && ln.Tspec == nil {
-				continue
-			}
-			// If runs in series, waits for the previous iteration to finish.
-			if !r.parallel {
-				wg.Wait()
-			}
-			wg.Add(1)
-			// Some retimer cannot handle parameter reading overlapping with margining on another lane.
-			r.rxwg.Add(1)
-			go func(ln *Lane) {
-				defer wg.Done()
-				ln.MarginLane()
-			}(ln)
-		}
-		wg.Wait()
+		r.marginLanes()
 
 		// Gather result protobuf
 		lncnt := 0
@@ -213,7 +151,7 @@ func (lt *linktest) marginLink() {
 			linkcheck = false
 			message := fmt.Sprintf("Link width/speed changed from gen%dx%d to gen%dx%d.",
 				r.port.gen, r.port.width, gen, width)
-			log.Errorf("%s Post margin at %s, %s", r.port.dev.BDFString(), r.rec.String(), message)
+			log.Errorf("%s: Post margin, %s", r.rxRepr(), message)
 
 			fullMessage := lt.pb.GetMessage() + message + " | "
 			lt.pb.Message = &fullMessage
@@ -307,6 +245,74 @@ func (lt *linktest) marginLink() {
 	lt.pb.ReceiverLanes = lanes
 }
 
+// createReceiver creates the receiver rxEnum of the link lt, and initializes its lanes.
+// dspLnkSta2 is the DSP Link Status 2 register, which tells which retimers are present.
+// It returns nil for the broadcast and reserved receiver numbers, and for the receivers
+// of an absent retimer.
+func createReceiver(lt *linktest, rxEnum lmtpb.LinkMargin_ReceiverEnum, dspLnkSta2 uint16) *receiver {
+	retimer0 := (dspLnkSta2 & C.PCI_EXP_LINKSTA2_RETIMER) != 0
+	retimer1 := (dspLnkSta2 & C.PCI_EXP_LINKSTA2_2RETIMERS) != 0
+	// The index corresponds to the receiver number, where 0 is for broadcasting. not an actual
+	// receiver point. Only 1 to 6 are valid
+	if rxEnum == lmtpb.LinkMargin_R_BROADCAST0 ||
+		rxEnum == lmtpb.LinkMargin_R_RESERVED {
+		return nil
+	}
+	// Skips retimer receivers if they are not detected
+	if (rxEnum == lmtpb.LinkMargin_R_RTU_B2 ||
+		rxEnum == lmtpb.LinkMargin_R_RTD_C3) && !retimer0 {
+		return nil
+	}
+	if (rxEnum == lmtpb.LinkMargin_R_RTU_D4 ||
+		rxEnum == lmtpb.LinkMargin_R_RTD_E5) && !retimer1 {
+		return nil
+	}
+
+	rxpt := new(receiver)
+	rxpt.testReady = false
+	rxpt.rec = rxEnum
+	// Other than the USP, all retimer and usp receivers run from the DSP port.
+	if rxpt.rec == lmtpb.LinkMargin_R_USP_F6 {
+		rxpt.port = lt.usp
+	} else {
+		rxpt.port = lt.dsp
+	}
+	rxpt.hwinfo = "BDF=" + rxpt.port.dev.BDFString() + ";RX=" + strings.TrimPrefix(rxpt.rec.String(), "R_")
+	rxpt.linkwg = lt.wg
+	rxpt.rxwg = new(sync.WaitGroup)
+	rxpt.lanes = make([]*Lane, rxpt.port.width, rxpt.port.width)
+	for i := range rxpt.lanes {
+		rxpt.lanes[i] = new(Lane)
+		rxpt.lanes[i].Init(lt.pb, rxpt.port.dev, i, rxpt.port.lmrAddr,
+			rxpt.rec, rxpt.port.speed, rxpt.rxwg, rxpt.linkwg, rxpt)
+	}
+	// Run lanes in parallel if the receiver lane has independent error sampler.
+	var err error
+	if rxpt.parallel, err = rxpt.lanes[0].GetIndErrorSampler(); err != nil {
+		message := lt.pb.GetMessage() + err.Error() + " | "
+		lt.pb.Message = &message
+	}
+	// Registers the margin hooks.
+	rxpt.marginHooks = buildMarginHooks(rxpt)
+	return rxpt
+}
+
+// outputLaneError streams an OCP error artifact for a lane that failed early.
+func (r *receiver) outputLaneError(ln *Lane, err error) {
+	ocpErr := &ocppb.Error{
+		Symptom: "pcie-lane-execution-error",
+		Message: fmt.Sprintf("Lane %d failed early: %v", ln.laneNumber, err),
+	}
+	stepArti := &ocppb.TestStepArtifact{
+		Artifact:   &ocppb.TestStepArtifact_Error{ocpErr},
+		TestStepId: r.hwinfo,
+	}
+	outArti := &ocppb.OutputArtifact{
+		Artifact: &ocppb.OutputArtifact_TestStepArtifact{stepArti},
+	}
+	outputArtifact(outArti)
+}
+
 // GatherResult stuffs test results into proto messages.
 func (ln *Lane) GatherResult() *lmtpb.LinkMargin_Lane {
 	if ln.lane == nil {
@@ -378,11 +384,31 @@ func (lt *linktest) restoreLink() {
 
 		addr = p.pcieCapOffset + C.PCI_EXP_LNKCTL2
 		val = pci.ReadWord(p.dev, addr)
-		if p.hawd {
+		if p.hasd {
 			val = val | C.PCI_EXP_LNKCTL2_SPEED_DIS
 		} else {
 			val = val &^ C.PCI_EXP_LNKCTL2_SPEED_DIS
 		}
 		pci.WriteWord(p.dev, addr, val)
 	}
+}
+
+// linkRepr formats BDF and Receiver for TestSpec logs.
+func linkRepr(dev pci.Dev, rec lmtpb.LinkMargin_ReceiverEnum) string {
+	bdfStr := dev.BDFString()
+	rxStr := strings.TrimPrefix(rec.String(), "R_")
+	return fmt.Sprintf("BDF[%s]; Rx[%s]", bdfStr, rxStr)
+}
+
+// rxRepr formats BDF and Receiver for receiver-wide logs.
+func (r *receiver) rxRepr() string {
+	bdfStr := "unknown"
+	if r != nil && r.port != nil {
+		bdfStr = r.port.dev.BDFString()
+	}
+	rxStr := "unknown"
+	if r != nil {
+		rxStr = strings.TrimPrefix(r.rec.String(), "R_")
+	}
+	return fmt.Sprintf("BDF[%s]; Rx[%s]", bdfStr, rxStr)
 }

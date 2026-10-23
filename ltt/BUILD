@@ -13,7 +13,7 @@
 # limitations under the License.
 
 load("@bazel_gazelle//:def.bzl", "gazelle")
-load("@io_bazel_rules_go//go:def.bzl", "go_binary", "go_library")
+load("@io_bazel_rules_go//go:def.bzl", "go_binary", "go_library", "go_test")
 load("@io_bazel_rules_go//proto:def.bzl", "go_proto_library")
 load("@rules_proto//proto:defs.bzl", "proto_library")
 
@@ -36,6 +36,8 @@ go_library(
     name = "linktrain",
     srcs = [
         "linktrain.go",
+        "trainerror.go",
+        "trainpolling.go",
     ],
     cdeps = [
         "@pciutils//:libpci",
@@ -52,6 +54,22 @@ go_library(
         "@org_golang_google_protobuf//proto",
         "@org_golang_google_protobuf//types/known/structpb",
         "@org_golang_google_protobuf//types/known/timestamppb",
+    ],
+)
+
+go_test(
+    name = "linktrain_test",
+    srcs = ["linktrain_test.go"],
+    data = ["example_ltt.pbtxt"],
+    embed = [":linktrain"],
+    deps = [
+        ":ltt_go_proto",
+        "//:pciutils",
+        "@com_github_google_go_cmp//cmp",
+        "@ocpdiag//:results_go_proto",
+        "@org_golang_google_protobuf//encoding/prototext",
+        "@org_golang_google_protobuf//proto",
+        "@org_golang_google_protobuf//testing/protocmp",
     ],
 )
 
