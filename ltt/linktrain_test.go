@@ -666,6 +666,29 @@ func TestMatchID(t *testing.T) {
 	}
 }
 
+func TestMatchIDs(t *testing.T) {
+	testCases := []struct {
+		name string
+		want []uint32
+		got  uint16
+		ok   bool
+	}{
+		{name: "nil slice is a wildcard", want: nil, got: 0x1ae0, ok: true},
+		{name: "empty slice is a wildcard", want: []uint32{}, got: 0x1ae0, ok: true},
+		{name: "single match", want: []uint32{0x1ae0}, got: 0x1ae0, ok: true},
+		{name: "any entry matches", want: []uint32{0x8086, 0x1ae0}, got: 0x1ae0, ok: true},
+		{name: "mismatch", want: []uint32{0x8086, 0x1000}, got: 0x1ae0, ok: false},
+		{name: "out of 16-bit range never matches", want: []uint32{0x11ae0}, got: 0x1ae0, ok: false},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := matchIDs(tc.want, tc.got); got != tc.ok {
+				t.Errorf("matchIDs(%v, %#x) = %v, want %v", tc.want, tc.got, got, tc.ok)
+			}
+		})
+	}
+}
+
 func TestMatchLinkTarget(t *testing.T) {
 	// An example link: an endpoint USP 1ae0:0075 behind a CPU root port DSP
 	// 8086:352a at 0000:15:01.0.
@@ -711,6 +734,36 @@ func TestMatchLinkTarget(t *testing.T) {
 				DspDeviceId: proto.Uint32(0x352a),
 			},
 			want: true,
+		},
+		{
+			name: "usp_device_ids and dsp_device_ids match",
+			target: &pb.PcieLinkTarget{
+				UspVendorId:  proto.Uint32(0x1ae0),
+				UspDeviceIds: []uint32{0x0074, 0x0075},
+				DspVendorId:  proto.Uint32(0x8086),
+				DspDeviceIds: []uint32{0x352a, 0x352c, 0x352d},
+			},
+			want: true,
+		},
+		{
+			name: "usp_device_ids mismatches",
+			target: &pb.PcieLinkTarget{
+				UspVendorId:  proto.Uint32(0x1ae0),
+				UspDeviceIds: []uint32{0x0074, 0x0076},
+				DspVendorId:  proto.Uint32(0x8086),
+				DspDeviceIds: []uint32{0x352a, 0x352c},
+			},
+			want: false,
+		},
+		{
+			name: "dsp_device_ids mismatches",
+			target: &pb.PcieLinkTarget{
+				UspVendorId:  proto.Uint32(0x1ae0),
+				UspDeviceId:  proto.Uint32(0x0075),
+				DspVendorId:  proto.Uint32(0x8086),
+				DspDeviceIds: []uint32{0x352c, 0x352d},
+			},
+			want: false,
 		},
 		{
 			name: "vendor only wildcard matches both ends",
@@ -822,11 +875,47 @@ func TestValidateLinkTarget(t *testing.T) {
 		{name: "all_links true", target: &pb.PcieLinkTarget{AllLinks: proto.Bool(true)}},
 		{name: "usp_vendor_id only", target: &pb.PcieLinkTarget{UspVendorId: proto.Uint32(0x1ae0)}},
 		{name: "usp_device_id only", target: &pb.PcieLinkTarget{UspDeviceId: proto.Uint32(0x0075)}},
+		{name: "usp_device_ids only", target: &pb.PcieLinkTarget{UspDeviceIds: []uint32{0x0074, 0x0075}}},
 		{name: "usp_bdfs only", target: &pb.PcieLinkTarget{UspBdfs: []string{"0000:16:00.0"}}},
 		{name: "dsp_vendor_id only", target: &pb.PcieLinkTarget{DspVendorId: proto.Uint32(0x8086)}},
 		{name: "dsp_device_id only", target: &pb.PcieLinkTarget{DspDeviceId: proto.Uint32(0x352a)}},
+		{name: "dsp_device_ids only", target: &pb.PcieLinkTarget{DspDeviceIds: []uint32{0x352a, 0x352c}}},
 		{name: "dsp_bdfs only", target: &pb.PcieLinkTarget{DspBdfs: []string{"0000:15:01.0"}}},
 		{name: "usp_vendor_id zero is a filter", target: &pb.PcieLinkTarget{UspVendorId: proto.Uint32(0)}},
+		{
+			name: "both usp_device_id and usp_device_ids rejected",
+			target: &pb.PcieLinkTarget{
+				UspDeviceId:  proto.Uint32(0x0075),
+				UspDeviceIds: []uint32{0x0075},
+			},
+			wantErr: true,
+		},
+		{
+			name: "explicit zero usp_device_id with usp_device_ids rejected",
+			target: &pb.PcieLinkTarget{
+				UspDeviceId:  proto.Uint32(0),
+				UspDeviceIds: []uint32{0x0075},
+			},
+			wantErr: true,
+		},
+		{
+			name: "both dsp_device_id and dsp_device_ids rejected",
+			target: &pb.PcieLinkTarget{
+				DspDeviceId:  proto.Uint32(0x352a),
+				DspDeviceIds: []uint32{0x352a, 0x352c},
+			},
+			wantErr: true,
+		},
+		{
+			name:    "zero in usp_device_ids rejected",
+			target:  &pb.PcieLinkTarget{UspDeviceIds: []uint32{0x0075, 0}},
+			wantErr: true,
+		},
+		{
+			name:    "zero in dsp_device_ids rejected",
+			target:  &pb.PcieLinkTarget{DspDeviceIds: []uint32{0, 0x352a}},
+			wantErr: true,
+		},
 		{
 			name: "valid bdfs",
 			target: &pb.PcieLinkTarget{
@@ -1064,6 +1153,7 @@ func TestMatchTestTargetSkipsUnlistedUSP(t *testing.T) {
 		{UspBdfs: []string{"ffff:ff:1f.7"}},
 		{UspVendorId: proto.Uint32(0xffff)},
 		{UspDeviceId: proto.Uint32(0xffff)},
+		{UspDeviceIds: []uint32{0xffff}},
 	} {
 		cfg := &pb.LinkTrain{LinkTarget: target}
 		for dev := devs; dev.Valid(); dev = dev.GetNext() {
