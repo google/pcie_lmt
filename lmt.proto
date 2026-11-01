@@ -31,17 +31,30 @@ message LinkMarginTest {
 // upstream port, or a switch whose ports all share the same IDs.
 // All set fields are ANDed. An unset field is a wildcard that matches any
 // value. The IDs are 16-bit PCI IDs; protobuf has no uint16 type.
-// At least one of the six filter fields (usp_vendor_id, usp_device_id,
-// usp_bdfs, dsp_vendor_id, dsp_device_id, dsp_bdfs) must be set, unless
-// all_links is true. Otherwise the test fails before any link is touched.
+// At least one of the eight filter fields (usp_vendor_id, usp_device_id,
+// usp_device_ids, usp_bdfs, dsp_vendor_id, dsp_device_id, dsp_device_ids,
+// dsp_bdfs) must be set, unless all_links is true. Otherwise the test fails
+// before any link is touched.
 message PcieLinkTarget {
   optional uint32 usp_vendor_id = 1;
+  // Matches a single USP device ID. Mutually exclusive with usp_device_ids.
   optional uint32 usp_device_id = 2;
+  // Matches any of the listed USP device IDs. An empty list is a wildcard.
+  // Setting both usp_device_id and usp_device_ids is rejected. Unlike an
+  // explicit usp_device_id of 0, which is a filter matching only ID 0, a 0
+  // element is rejected because it is not a valid PCI device ID in a list.
+  repeated uint32 usp_device_ids = 8;
   // The link's USP must be one of these BDFs, in the format of
   // "0000:00:00.0". An empty list is a wildcard. A malformed BDF is an error.
   repeated string usp_bdfs = 3;
   optional uint32 dsp_vendor_id = 4;
+  // Matches a single DSP device ID. Mutually exclusive with dsp_device_ids.
   optional uint32 dsp_device_id = 5;
+  // Matches any of the listed DSP device IDs. An empty list is a wildcard.
+  // Setting both dsp_device_id and dsp_device_ids is rejected. Unlike an
+  // explicit dsp_device_id of 0, which is a filter matching only ID 0, a 0
+  // element is rejected because it is not a valid PCI device ID in a list.
+  repeated uint32 dsp_device_ids = 9;
   // The link's DSP must be one of these BDFs, in the format of
   // "0000:00:00.0". An empty list is a wildcard. A malformed BDF is an error.
   repeated string dsp_bdfs = 6;
