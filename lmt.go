@@ -125,6 +125,7 @@ func main() {
 		}
 		deviceID := uint32(*did)
 		cfg.LinkTarget.UspDeviceId = &deviceID
+		cfg.LinkTarget.UspDeviceIds = nil
 	}
 
 	// Overrides BDF from command line flags.
