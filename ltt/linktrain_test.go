@@ -156,12 +156,14 @@ func TestReadLinkTrainProtoErrors(t *testing.T) {
 		}
 	})
 
-	// The removed USP filters must fail to parse rather than be silently
-	// dropped, which would select every link.
+	// The removed link filters must fail to parse rather than be silently
+	// dropped, which could select more links.
 	for field, content := range map[string]string{
-		"vendor_id": `vendor_id: 0x1ae0`,
-		"device_id": `device_id: 0x0075`,
-		"bdf":       `bdf: "0000:16:00.0"`,
+		"vendor_id":     `vendor_id: 0x1ae0`,
+		"device_id":     `device_id: 0x0075`,
+		"bdf":           `bdf: "0000:16:00.0"`,
+		"usp_device_id": `link_target: { usp_device_id: 0x0075 }`,
+		"dsp_device_id": `link_target: { dsp_device_id: 0x352a }`,
 	} {
 		t.Run("RemovedField_"+field, func(t *testing.T) {
 			fn := filepath.Join(t.TempDir(), "legacy.pbtxt")
@@ -726,16 +728,6 @@ func TestMatchLinkTarget(t *testing.T) {
 			want: true,
 		},
 		{
-			name: "deprecated singular device ids match",
-			target: &pb.PcieLinkTarget{
-				UspVendorId: proto.Uint32(0x1ae0),
-				UspDeviceId: proto.Uint32(0x0075),
-				DspVendorId: proto.Uint32(0x8086),
-				DspDeviceId: proto.Uint32(0x352a),
-			},
-			want: true,
-		},
-		{
 			name: "usp_device_ids and dsp_device_ids match",
 			target: &pb.PcieLinkTarget{
 				UspVendorId:  proto.Uint32(0x1ae0),
@@ -805,7 +797,7 @@ func TestMatchLinkTarget(t *testing.T) {
 			name: "field set to zero is not a wildcard",
 			target: &pb.PcieLinkTarget{
 				UspVendorId: proto.Uint32(0x1ae0),
-				DspDeviceId: proto.Uint32(0),
+				DspVendorId: proto.Uint32(0),
 			},
 			want: false,
 		},
@@ -874,38 +866,12 @@ func TestValidateLinkTarget(t *testing.T) {
 		{name: "all_links false", target: &pb.PcieLinkTarget{AllLinks: proto.Bool(false)}, wantErr: true},
 		{name: "all_links true", target: &pb.PcieLinkTarget{AllLinks: proto.Bool(true)}},
 		{name: "usp_vendor_id only", target: &pb.PcieLinkTarget{UspVendorId: proto.Uint32(0x1ae0)}},
-		{name: "usp_device_id only", target: &pb.PcieLinkTarget{UspDeviceId: proto.Uint32(0x0075)}},
 		{name: "usp_device_ids only", target: &pb.PcieLinkTarget{UspDeviceIds: []uint32{0x0074, 0x0075}}},
 		{name: "usp_bdfs only", target: &pb.PcieLinkTarget{UspBdfs: []string{"0000:16:00.0"}}},
 		{name: "dsp_vendor_id only", target: &pb.PcieLinkTarget{DspVendorId: proto.Uint32(0x8086)}},
-		{name: "dsp_device_id only", target: &pb.PcieLinkTarget{DspDeviceId: proto.Uint32(0x352a)}},
 		{name: "dsp_device_ids only", target: &pb.PcieLinkTarget{DspDeviceIds: []uint32{0x352a, 0x352c}}},
 		{name: "dsp_bdfs only", target: &pb.PcieLinkTarget{DspBdfs: []string{"0000:15:01.0"}}},
 		{name: "usp_vendor_id zero is a filter", target: &pb.PcieLinkTarget{UspVendorId: proto.Uint32(0)}},
-		{
-			name: "both usp_device_id and usp_device_ids rejected",
-			target: &pb.PcieLinkTarget{
-				UspDeviceId:  proto.Uint32(0x0075),
-				UspDeviceIds: []uint32{0x0075},
-			},
-			wantErr: true,
-		},
-		{
-			name: "explicit zero usp_device_id with usp_device_ids rejected",
-			target: &pb.PcieLinkTarget{
-				UspDeviceId:  proto.Uint32(0),
-				UspDeviceIds: []uint32{0x0075},
-			},
-			wantErr: true,
-		},
-		{
-			name: "both dsp_device_id and dsp_device_ids rejected",
-			target: &pb.PcieLinkTarget{
-				DspDeviceId:  proto.Uint32(0x352a),
-				DspDeviceIds: []uint32{0x352a, 0x352c},
-			},
-			wantErr: true,
-		},
 		{
 			name:    "zero in usp_device_ids rejected",
 			target:  &pb.PcieLinkTarget{UspDeviceIds: []uint32{0x0075, 0}},
@@ -1152,7 +1118,6 @@ func TestMatchTestTargetSkipsUnlistedUSP(t *testing.T) {
 	for _, target := range []*pb.PcieLinkTarget{
 		{UspBdfs: []string{"ffff:ff:1f.7"}},
 		{UspVendorId: proto.Uint32(0xffff)},
-		{UspDeviceId: proto.Uint32(0xffff)},
 		{UspDeviceIds: []uint32{0xffff}},
 	} {
 		cfg := &pb.LinkTrain{LinkTarget: target}

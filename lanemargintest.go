@@ -433,22 +433,15 @@ func matchBDF(bdfs []string, d pci.PCIDevInfo) bool {
 
 // validateLinkTarget returns an error if the link target sets no filter field
 // and does not set all_links, so that a spec that lost its filters fails the
-// test instead of silently selecting every link, if singular and repeated
-// device ID fields are combined or contain 0, or if any BDF in the link target
-// is malformed, so that a typo fails the test instead of silently matching
-// nothing. A nil target sets no filter field.
+// test instead of silently selecting every link, if a device ID list contains 0,
+// or if any BDF in the link target is malformed, so that a typo fails the test
+// instead of silently matching nothing. A nil target sets no filter field.
 func validateLinkTarget(target *lmtpb.PcieLinkTarget) error {
 	hasFilter := target != nil &&
-		(target.UspVendorId != nil || target.UspDeviceId != nil || len(target.GetUspDeviceIds()) > 0 || len(target.GetUspBdfs()) > 0 ||
-			target.DspVendorId != nil || target.DspDeviceId != nil || len(target.GetDspDeviceIds()) > 0 || len(target.GetDspBdfs()) > 0)
+		(target.UspVendorId != nil || len(target.GetUspDeviceIds()) > 0 || len(target.GetUspBdfs()) > 0 ||
+			target.DspVendorId != nil || len(target.GetDspDeviceIds()) > 0 || len(target.GetDspBdfs()) > 0)
 	if !hasFilter && !target.GetAllLinks() {
-		return errors.New("link_target sets no filter field (usp_vendor_id, usp_device_id, usp_device_ids, usp_bdfs, dsp_vendor_id, dsp_device_id, dsp_device_ids or dsp_bdfs) and all_links is not true; refusing to test every link")
-	}
-	if target.UspDeviceId != nil && len(target.GetUspDeviceIds()) > 0 {
-		return errors.New("link_target sets both usp_device_id and usp_device_ids; set only one")
-	}
-	if target.DspDeviceId != nil && len(target.GetDspDeviceIds()) > 0 {
-		return errors.New("link_target sets both dsp_device_id and dsp_device_ids; set only one")
+		return errors.New("link_target sets no filter field (usp_vendor_id, usp_device_ids, usp_bdfs, dsp_vendor_id, dsp_device_ids or dsp_bdfs) and all_links is not true; refusing to test every link")
 	}
 	if slices.Contains(target.GetUspDeviceIds(), 0) {
 		return errors.New("usp_device_ids in link_target must not contain 0")
@@ -508,10 +501,8 @@ func matchLinkTarget(uspInfo, dspInfo pci.PCIDevInfo, target *lmtpb.PcieLinkTarg
 		return true
 	}
 	return matchID(target.UspVendorId, uspInfo.VendorID) &&
-		matchID(target.UspDeviceId, uspInfo.DeviceID) &&
 		matchIDs(target.GetUspDeviceIds(), uspInfo.DeviceID) &&
 		matchID(target.DspVendorId, dspInfo.VendorID) &&
-		matchID(target.DspDeviceId, dspInfo.DeviceID) &&
 		matchIDs(target.GetDspDeviceIds(), dspInfo.DeviceID) &&
 		matchBDF(target.GetDspBdfs(), dspInfo)
 }
@@ -531,7 +522,7 @@ func getLinks(devs pci.Dev, cfg *lmtpb.LinkMargin) ([]*linktest, error) {
 		// device cannot fail the run. The DSP fields are checked after the DSP is
 		// found below.
 		if t := cfg.GetLinkTarget(); t != nil &&
-			(!matchID(t.UspVendorId, d.VendorID) || !matchID(t.UspDeviceId, d.DeviceID) || !matchIDs(t.GetUspDeviceIds(), d.DeviceID) || !matchBDF(t.GetUspBdfs(), d)) {
+			(!matchID(t.UspVendorId, d.VendorID) || !matchIDs(t.GetUspDeviceIds(), d.DeviceID) || !matchBDF(t.GetUspBdfs(), d)) {
 			continue
 		}
 		pf0Chk := (d.Dev == 0) && (d.Func == 0)

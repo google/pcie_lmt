@@ -123,7 +123,6 @@ func main() {
 		if cfg.LinkTarget == nil {
 			cfg.LinkTarget = &lmtpb.PcieLinkTarget{}
 		}
-		cfg.LinkTarget.UspDeviceId = nil
 		cfg.LinkTarget.UspDeviceIds = []uint32{uint32(*did)}
 	}
 

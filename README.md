@@ -37,10 +37,8 @@ top-level `LinkMargin` message specifies the PCIe link(s) to test through
 IDs, and BDFs of both the upstream port (`usp_vendor_id`, `usp_device_ids`,
 `usp_bdfs`) and downstream port (`dsp_vendor_id`, `dsp_device_ids`, `dsp_bdfs`)
 ends of each link (all set fields are ANDed and unset fields or empty lists act
-as wildcards). The singular `usp_device_id` and `dsp_device_id` fields are
-deprecated and will be removed; use `usp_device_ids` and `dsp_device_ids`
-instead. At least one of these six filter fields (or a deprecated singular
-device ID field) must be set, either in the spec or through the
+as wildcards). At least one of these six filter fields must be set, either in
+the spec or through the
 `-vendor_id`, `-device_id`, `-bus` or `-bdf` flags: a
 spec without any filter fails before any link is touched, unless `link_target`
 sets `all_links: true` to explicitly test every eligible link. Each receiver point
