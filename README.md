@@ -34,11 +34,13 @@ test explores the error rate both timing-wise and voltage-wise. Here's a
 A [lmt.proto](lmt.proto) specifies all aspects of the test, as well as logging the test result. The
 top-level `LinkMargin` message specifies the PCIe link(s) to test through
 `link_target` (`PcieLinkTarget`), which selects links by the vendor IDs, device
-IDs, and BDFs of both the upstream port (`usp_vendor_id`, `usp_device_id` or
-`usp_device_ids`, `usp_bdfs`) and downstream port (`dsp_vendor_id`,
-`dsp_device_id` or `dsp_device_ids`, `dsp_bdfs`) ends of each link (all set
-fields are ANDed and unset fields or empty lists act as wildcards). At least one
-of these eight filter fields must be set, either in the spec or through the
+IDs, and BDFs of both the upstream port (`usp_vendor_id`, `usp_device_ids`,
+`usp_bdfs`) and downstream port (`dsp_vendor_id`, `dsp_device_ids`, `dsp_bdfs`)
+ends of each link (all set fields are ANDed and unset fields or empty lists act
+as wildcards). The singular `usp_device_id` and `dsp_device_id` fields are
+deprecated and will be removed; use `usp_device_ids` and `dsp_device_ids`
+instead. At least one of these six filter fields (or a deprecated singular
+device ID field) must be set, either in the spec or through the
 `-vendor_id`, `-device_id`, `-bus` or `-bdf` flags: a
 spec without any filter fails before any link is touched, unless `link_target`
 sets `all_links: true` to explicitly test every eligible link. Each receiver point
@@ -103,15 +105,14 @@ If you wish to use **Bazel 9+**:
 ## Test Spec and Result Examples
 Refer to [lmt.proto](lmt.proto).
 
-Link target filter (all set fields are ANDed; unset fields act as wildcards;
-use `usp_device_ids` / `dsp_device_ids` instead of `usp_device_id` /
-`dsp_device_id` to match any of multiple device IDs; at least one field must be
-set unless `all_links: true` is set):
+Link target filter (all set fields are ANDed; unset fields and empty lists act
+as wildcards; `usp_device_ids` / `dsp_device_ids` match any of the listed device
+IDs; at least one field must be set unless `all_links: true` is set):
 
 ```
 link_target: {
   usp_vendor_id: 0x1000
-  usp_device_id: 0xc030
+  usp_device_ids: 0xc030
   usp_bdfs: "0000:81:00.0"
   usp_bdfs: "0000:a1:00.0"
   dsp_vendor_id: 0x8086

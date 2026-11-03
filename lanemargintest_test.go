@@ -29,9 +29,9 @@ import (
 func TestReadLinkMargin(t *testing.T) {
 	want := &lmtpb.LinkMargin{
 		LinkTarget: &lmtpb.PcieLinkTarget{
-			UspVendorId: proto.Uint32(0x1ae0),
-			UspDeviceId: proto.Uint32(0x0060),
-			UspBdfs:     []string{"0000:1a:00.0", "0000:39:00.0"},
+			UspVendorId:  proto.Uint32(0x1ae0),
+			UspDeviceIds: []uint32{0x0060},
+			UspBdfs:      []string{"0000:1a:00.0", "0000:39:00.0"},
 		},
 		TestSpecs: []*lmtpb.LinkMargin_TestSpec{
 			{
@@ -47,7 +47,7 @@ func TestReadLinkMargin(t *testing.T) {
 		content := `
 link_target: {
 	usp_vendor_id: 0x1ae0
-	usp_device_id: 0x0060
+	usp_device_ids: 0x0060
 	usp_bdfs: ["0000:1a:00.0", "0000:39:00.0"]
 }
 test_specs: {
@@ -74,7 +74,7 @@ test_specs: {
 		content := `{
   "link_target": {
     "usp_vendor_id": 6880,
-    "usp_device_id": 96,
+    "usp_device_ids": [96],
     "usp_bdfs": ["0000:1a:00.0", "0000:39:00.0"]
   },
   "test_specs": [
@@ -230,21 +230,21 @@ func TestMatchLinkTarget(t *testing.T) {
 		{
 			name: "usp only matches",
 			target: &lmtpb.PcieLinkTarget{
-				UspVendorId: proto.Uint32(0x1ae0),
-				UspDeviceId: proto.Uint32(0x0075),
+				UspVendorId:  proto.Uint32(0x1ae0),
+				UspDeviceIds: []uint32{0x0075},
 			},
 			want: true,
 		},
 		{
 			name: "dsp only matches",
 			target: &lmtpb.PcieLinkTarget{
-				DspVendorId: proto.Uint32(0x8086),
-				DspDeviceId: proto.Uint32(0x352a),
+				DspVendorId:  proto.Uint32(0x8086),
+				DspDeviceIds: []uint32{0x352a},
 			},
 			want: true,
 		},
 		{
-			name: "both ends match",
+			name: "deprecated singular device ids match",
 			target: &lmtpb.PcieLinkTarget{
 				UspVendorId: proto.Uint32(0x1ae0),
 				UspDeviceId: proto.Uint32(0x0075),
@@ -277,7 +277,7 @@ func TestMatchLinkTarget(t *testing.T) {
 			name: "dsp_device_ids mismatches",
 			target: &lmtpb.PcieLinkTarget{
 				UspVendorId:  proto.Uint32(0x1ae0),
-				UspDeviceId:  proto.Uint32(0x0075),
+				UspDeviceIds: []uint32{0x0075},
 				DspVendorId:  proto.Uint32(0x8086),
 				DspDeviceIds: []uint32{0x352c, 0x352d},
 			},
@@ -294,20 +294,20 @@ func TestMatchLinkTarget(t *testing.T) {
 		{
 			name: "usp mismatches",
 			target: &lmtpb.PcieLinkTarget{
-				UspVendorId: proto.Uint32(0x1ae0),
-				UspDeviceId: proto.Uint32(0x0076),
-				DspVendorId: proto.Uint32(0x8086),
-				DspDeviceId: proto.Uint32(0x352a),
+				UspVendorId:  proto.Uint32(0x1ae0),
+				UspDeviceIds: []uint32{0x0076},
+				DspVendorId:  proto.Uint32(0x8086),
+				DspDeviceIds: []uint32{0x352a},
 			},
 			want: false,
 		},
 		{
 			name: "dsp mismatches",
 			target: &lmtpb.PcieLinkTarget{
-				UspVendorId: proto.Uint32(0x1ae0),
-				UspDeviceId: proto.Uint32(0x0075),
-				DspVendorId: proto.Uint32(0x1ae0),
-				DspDeviceId: proto.Uint32(0x0075),
+				UspVendorId:  proto.Uint32(0x1ae0),
+				UspDeviceIds: []uint32{0x0075},
+				DspVendorId:  proto.Uint32(0x1ae0),
+				DspDeviceIds: []uint32{0x0075},
 			},
 			want: false,
 		},
@@ -339,9 +339,9 @@ func TestMatchLinkTarget(t *testing.T) {
 		{
 			name: "dsp ids match but dsp bdf mismatches",
 			target: &lmtpb.PcieLinkTarget{
-				DspVendorId: proto.Uint32(0x8086),
-				DspDeviceId: proto.Uint32(0x352a),
-				DspBdfs:     []string{"0000:37:01.0"},
+				DspVendorId:  proto.Uint32(0x8086),
+				DspDeviceIds: []uint32{0x352a},
+				DspBdfs:      []string{"0000:37:01.0"},
 			},
 			want: false,
 		},

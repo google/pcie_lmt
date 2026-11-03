@@ -107,7 +107,7 @@ func main() {
 	// Overrides Vendor ID from command line flags.
 	if *vid != -1 {
 		if *vid < 0 || *vid > 0xFFFF {
-			log.Exit("The vendor_id = ", fmt.Sprintf("%04x", *vid), " option is out of range [0:0xFFFF].")
+			log.Exit("The vendor_id = ", fmt.Sprintf("%#04x", *vid), " option is out of range [0:0xFFFF].")
 		}
 		if cfg.LinkTarget == nil {
 			cfg.LinkTarget = &lmtpb.PcieLinkTarget{}
@@ -117,15 +117,14 @@ func main() {
 	}
 	// Overrides Device ID from command line flags.
 	if *did != -1 {
-		if *did < 0 || *did > 0xFFFF {
-			log.Exit("The device_id = ", fmt.Sprintf("%04x", *did), " option is out of range [0:0xFFFF].")
+		if *did < 1 || *did > 0xFFFF {
+			log.Exit("The device_id = ", fmt.Sprintf("%#04x", *did), " option is out of range [1:0xFFFF].")
 		}
 		if cfg.LinkTarget == nil {
 			cfg.LinkTarget = &lmtpb.PcieLinkTarget{}
 		}
-		deviceID := uint32(*did)
-		cfg.LinkTarget.UspDeviceId = &deviceID
-		cfg.LinkTarget.UspDeviceIds = nil
+		cfg.LinkTarget.UspDeviceId = nil
+		cfg.LinkTarget.UspDeviceIds = []uint32{uint32(*did)}
 	}
 
 	// Overrides BDF from command line flags.
