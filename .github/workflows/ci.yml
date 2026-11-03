@@ -19,11 +19,14 @@ on:
     branches:
       - master
       - main
-      - "test_**"
   pull_request:
     branches:
       - master
       - main
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build-and-test:
