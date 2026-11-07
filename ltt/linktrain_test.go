@@ -23,6 +23,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/go-cmp/cmp"
 	"google.golang.org/protobuf/encoding/prototext"
@@ -1550,6 +1551,397 @@ func TestGetLinksBuildsLinktest(t *testing.T) {
 		_, err := getLinks(devs, &pb.LinkTrain{RecoverSriovCapRegs: true})
 		if err == nil || !strings.Contains(err.Error(), "sriov broken") {
 			t.Errorf("getLinks() error = %v, want sriov broken error", err)
+		}
+	})
+}
+
+func TestRetrainHandshake(t *testing.T) {
+	const (
+		dspCap       = int32(0x80)
+		uspCap       = int32(0x40)
+		secExtCap    = int32(0x180)
+		offLnkCap    = int32(0x0c)
+		offLnkCtl    = int32(0x10)
+		offLnkSta    = int32(0x12)
+		offSecLnkCtl = int32(0x04)
+
+		lnkCapLBNC        = uint32(0x00200000)
+		lnkCtlDisable     = uint16(0x0010)
+		lnkCtlRetrain     = uint16(0x0020)
+		lnkStaSpeedGen5   = uint16(0x0005)
+		lnkStaSpeedGen4   = uint16(0x0004)
+		lnkStaTrain       = uint16(0x0800)
+		lnkStaDLAct       = uint16(0x2000)
+		lnkStaBWMgmt      = uint16(0x4000)
+		lnkStaAutBW       = uint16(0x8000)
+		secLnkCtlPerformE = uint16(0x0001)
+	)
+
+	saveHooks := func(t *testing.T) {
+		t.Helper()
+		origReadWord := pciReadWord
+		origReadLong := pciReadLong
+		origWriteWord := pciWriteWord
+		origFindCap := pciFindCapability
+		origPollInterval := linkStatusPollInterval
+		origUpTimeout := linkUpTimeout
+		origStableDelay := linkUpStableDelay
+		origDownTimeout := linkDownTimeout
+		t.Cleanup(func() {
+			pciReadWord = origReadWord
+			pciReadLong = origReadLong
+			pciWriteWord = origWriteWord
+			pciFindCapability = origFindCap
+			linkStatusPollInterval = origPollInterval
+			linkUpTimeout = origUpTimeout
+			linkUpStableDelay = origStableDelay
+			linkDownTimeout = origDownTimeout
+		})
+	}
+
+	newLinktest := func() *Linktest {
+		return &Linktest{
+			uspPCIeCapOffset:         uspCap,
+			dspPCIeCapOffset:         dspCap,
+			reenableWaitAfterDisable: 1 * time.Millisecond,
+			Cfg: &pb.LinkTrain{
+				UspBdf: proto.String("0000:11:00.0"),
+				DspBdf: proto.String("0000:10:01.1"),
+			},
+		}
+	}
+
+	t.Run("retrain waits for prior training, clears BWMGMT via W1C, polls BWMGMT, and skips 100ms delay", func(t *testing.T) {
+		saveHooks(t)
+		linkStatusPollInterval = 1 * time.Millisecond
+		linkUpTimeout = 100 * time.Millisecond
+		// Keep a large linkUpStableDelay so any accidental call to pollLinkUp is caught.
+		linkUpStableDelay = 250 * time.Millisecond
+
+		type writeOp struct {
+			addr int32
+			val  uint16
+		}
+		var writes []writeOp
+
+		// Simulate DSP initially finishing a prior training (1 read with TRAIN=1, then TRAIN=0),
+		// with both BWMGMT and AUTBW initially 1b. After Retrain Link is written:
+		//   - Poll 1: stale pre-Recovery L0 read (TRAIN=0, BWMGMT=0) -> must NOT finish yet!
+		//   - Poll 2: in Recovery (TRAIN=1, BWMGMT=0) -> must NOT finish yet!
+		//   - Poll 3: Recovery exited to L0 (TRAIN=0, BWMGMT=1, DL_ACT=1, Gen5) -> finishes!
+		dspSta := lnkStaDLAct | lnkStaSpeedGen5 | lnkStaBWMgmt | lnkStaAutBW
+		preReads := 0
+		postRetrainReads := 0
+		retrainTriggered := false
+
+		pciReadLong = func(_ pci.Dev, addr int32) uint32 {
+			if addr == dspCap+offLnkCap {
+				return lnkCapLBNC
+			}
+			return 0
+		}
+		pciReadWord = func(_ pci.Dev, addr int32) uint16 {
+			switch addr {
+			case dspCap + offLnkSta:
+				if !retrainTriggered {
+					preReads++
+					if preReads == 1 {
+						return dspSta | lnkStaTrain
+					}
+					return dspSta
+				}
+				postRetrainReads++
+				switch postRetrainReads {
+				case 1:
+					// Stale L0 read before LTSSM enters Recovery (BWMGMT=0, TRAIN=0).
+					return dspSta
+				case 2:
+					// Active Recovery (TRAIN=1, BWMGMT=0).
+					return dspSta | lnkStaTrain
+				default:
+					// Completed Recovery (TRAIN=0, BWMGMT=1).
+					dspSta |= lnkStaBWMgmt
+					return dspSta
+				}
+			case dspCap + offLnkCtl:
+				return 0x0440 // Include BWMIE (0x0400) + Common Clock (0x0040) to verify BWMIE masking/restoration.
+			case uspCap + offLnkSta:
+				return lnkStaDLAct | lnkStaSpeedGen5
+			default:
+				return 0
+			}
+		}
+		pciWriteWord = func(_ pci.Dev, addr int32, val uint16) {
+			writes = append(writes, writeOp{addr: addr, val: val})
+			switch addr {
+			case dspCap + offLnkSta:
+				// RW1C semantics: writing 1 clears that status bit; writing 0 preserves it.
+				dspSta &^= val & (lnkStaBWMgmt | lnkStaAutBW)
+			case dspCap + offLnkCtl:
+				if val&lnkCtlRetrain != 0 {
+					retrainTriggered = true
+				}
+			}
+		}
+
+		lt := newLinktest()
+		start := time.Now()
+		err := lt.retrain()
+		elapsed := time.Since(start)
+		if err != nil {
+			t.Fatalf("retrain() unexpected error: %v", err)
+		}
+		if elapsed >= 150*time.Millisecond {
+			t.Errorf("retrain() took %v, want < 150ms (must not sleep linkUpStableDelay=%v)", elapsed, linkUpStableDelay)
+		}
+		wantWrites := []writeOp{
+			{addr: dspCap + offLnkCtl, val: 0x0040},
+			{addr: dspCap + offLnkSta, val: lnkStaBWMgmt},
+			{addr: dspCap + offLnkCtl, val: 0x0040 | lnkCtlRetrain},
+			{addr: dspCap + offLnkSta, val: lnkStaBWMgmt},
+			{addr: dspCap + offLnkCtl, val: 0x0440},
+		}
+		if !slices.Equal(writes, wantWrites) {
+			t.Errorf("retrain() writes = %+v, want %+v", writes, wantWrites)
+		}
+		if dspSta&lnkStaBWMgmt != 0 {
+			t.Errorf("retrain() left BWMGMT=1 when restoring BWMIE=1 (dspSta=0x%04x)", dspSta)
+		}
+		if dspSta&lnkStaAutBW == 0 {
+			t.Errorf("retrain() inadvertently cleared RW1C AUTBW bit (dspSta=0x%04x)", dspSta)
+		}
+		if postRetrainReads < 3 {
+			t.Errorf("retrain() polled DSP Link Status %d times after trigger, want >= 3", postRetrainReads)
+		}
+	})
+
+	t.Run("retrainWithEQ sets Perform Equalization and waits for BWMGMT=1 even if PERFORM_LINK_EQU stays set", func(t *testing.T) {
+		saveHooks(t)
+		linkStatusPollInterval = 1 * time.Millisecond
+		linkUpTimeout = 100 * time.Millisecond
+		linkUpStableDelay = 250 * time.Millisecond
+
+		pciFindCapability = func(_ pci.Dev, capID uint16, _ uint32) (int32, error) {
+			if capID == 0x0019 {
+				return secExtCap, nil
+			}
+			return 0, errors.New("unexpected cap lookup")
+		}
+		pciReadLong = func(_ pci.Dev, addr int32) uint32 {
+			if addr == dspCap+offLnkCap {
+				return lnkCapLBNC
+			}
+			return 0
+		}
+
+		var lnkCtl3 uint16 = 0x0002 // Preserve unrelated bit 1; hardware leaves PERFORM_LINK_EQU set.
+		dspSta := lnkStaDLAct | lnkStaSpeedGen5 | lnkStaBWMgmt
+		polls := 0
+		retrainTriggered := false
+
+		pciReadWord = func(_ pci.Dev, addr int32) uint16 {
+			switch addr {
+			case secExtCap + offSecLnkCtl:
+				return lnkCtl3
+			case dspCap + offLnkSta:
+				if retrainTriggered {
+					polls++
+					if polls >= 3 {
+						dspSta |= lnkStaBWMgmt
+					}
+				}
+				return dspSta
+			case dspCap + offLnkCtl:
+				return 0
+			case uspCap + offLnkSta:
+				return lnkStaDLAct | lnkStaSpeedGen5
+			default:
+				return 0
+			}
+		}
+		pciWriteWord = func(_ pci.Dev, addr int32, val uint16) {
+			switch addr {
+			case dspCap + offLnkSta:
+				dspSta &^= val & lnkStaBWMgmt
+			case secExtCap + offSecLnkCtl:
+				lnkCtl3 = val
+			case dspCap + offLnkCtl:
+				if val&lnkCtlRetrain != 0 {
+					retrainTriggered = true
+				}
+			}
+		}
+
+		lt := newLinktest()
+		start := time.Now()
+		if err := lt.retrainWithEQ(); err != nil {
+			t.Fatalf("retrainWithEQ() unexpected error: %v", err)
+		}
+		if elapsed := time.Since(start); elapsed >= 150*time.Millisecond {
+			t.Errorf("retrainWithEQ() took %v, want < 150ms", elapsed)
+		}
+		if lnkCtl3 != (0x0002 | secLnkCtlPerformE) {
+			t.Errorf("retrainWithEQ() lnkCtl3 = 0x%04x, want 0x%04x", lnkCtl3, 0x0002|secLnkCtlPerformE)
+		}
+		if polls < 3 {
+			t.Errorf("retrainWithEQ() finished after %d polls, want >= 3 (must wait for BWMGMT=1)", polls)
+		}
+	})
+
+	t.Run("retrainWithEQ returns ErrSecPCIeExtCapNotFound when Secondary PCIe cap is absent", func(t *testing.T) {
+		saveHooks(t)
+		pciFindCapability = func(pci.Dev, uint16, uint32) (int32, error) {
+			return 0, errors.New("cap 0x19 not found")
+		}
+		err := newLinktest().retrainWithEQ()
+		var te *TrainError
+		if !errors.As(err, &te) || te.Code != ErrSecPCIeExtCapNotFound {
+			t.Errorf("retrainWithEQ() error = %v, want TrainError with ErrSecPCIeExtCapNotFound", err)
+		}
+	})
+
+	t.Run("retrain falls back to pollLinkUp with linkUpStableDelay when LBNC is not supported", func(t *testing.T) {
+		saveHooks(t)
+		linkStatusPollInterval = 1 * time.Millisecond
+		linkUpTimeout = 50 * time.Millisecond
+		linkUpStableDelay = 20 * time.Millisecond
+
+		wroteLnkSta := false
+		pciReadLong = func(pci.Dev, int32) uint32 { return 0 } // LBNC = 0
+		pciReadWord = func(_ pci.Dev, addr int32) uint16 {
+			if addr == dspCap+offLnkSta || addr == uspCap+offLnkSta {
+				return lnkStaDLAct | lnkStaSpeedGen5 // BWMGMT hardwired 0
+			}
+			return 0
+		}
+		pciWriteWord = func(_ pci.Dev, addr int32, _ uint16) {
+			if addr == dspCap+offLnkSta {
+				wroteLnkSta = true
+			}
+		}
+
+		start := time.Now()
+		if err := newLinktest().retrain(); err != nil {
+			t.Fatalf("retrain() without LBNC failed: %v", err)
+		}
+		if elapsed := time.Since(start); elapsed < linkUpStableDelay {
+			t.Errorf("retrain() without LBNC took %v, want >= linkUpStableDelay (%v)", elapsed, linkUpStableDelay)
+		}
+		if wroteLnkSta {
+			t.Errorf("retrain() wrote to Link Status despite LBNC=0")
+		}
+	})
+
+	t.Run("retrain times out on stuck pre-retrain TRAIN, missing BWMGMT, or speed downgrade", func(t *testing.T) {
+		testCases := []struct {
+			name       string
+			preTrain   bool
+			bwMgmtSet  bool
+			uspSpeed   uint16
+			wantErrSub string
+		}{
+			{
+				name:       "stuck in training before retrain",
+				preTrain:   true,
+				wantErrSub: "stuck in training before retrain",
+			},
+			{
+				name:       "BWMGMT never asserted",
+				bwMgmtSet:  false,
+				uspSpeed:   lnkStaSpeedGen5,
+				wantErrSub: "BWMGMT=0",
+			},
+			{
+				name:       "USP speed downgrade",
+				bwMgmtSet:  true,
+				uspSpeed:   lnkStaSpeedGen4,
+				wantErrSub: "USP speed downgrade",
+			},
+		}
+		for _, tc := range testCases {
+			t.Run(tc.name, func(t *testing.T) {
+				saveHooks(t)
+				linkStatusPollInterval = 1 * time.Millisecond
+				linkUpTimeout = 5 * time.Millisecond
+
+				retrainTriggered := false
+				pciReadLong = func(pci.Dev, int32) uint32 { return lnkCapLBNC }
+				pciReadWord = func(_ pci.Dev, addr int32) uint16 {
+					switch addr {
+					case dspCap + offLnkSta:
+						if tc.preTrain {
+							return lnkStaDLAct | lnkStaSpeedGen5 | lnkStaTrain
+						}
+						sta := lnkStaDLAct | lnkStaSpeedGen5
+						if retrainTriggered && tc.bwMgmtSet {
+							sta |= lnkStaBWMgmt
+						}
+						return sta
+					case uspCap + offLnkSta:
+						return lnkStaDLAct | tc.uspSpeed
+					default:
+						return 0
+					}
+				}
+				pciWriteWord = func(_ pci.Dev, addr int32, val uint16) {
+					if addr == dspCap+offLnkCtl && val&lnkCtlRetrain != 0 {
+						retrainTriggered = true
+					}
+				}
+
+				err := newLinktest().retrain()
+				var te *TrainError
+				if !errors.As(err, &te) || te.Code != ErrLinkUpTimeout {
+					t.Fatalf("retrain() error = %v, want ErrLinkUpTimeout", err)
+				}
+				if !strings.Contains(te.Message, tc.wantErrSub) {
+					t.Errorf("retrain() error message = %q, want substring %q", te.Message, tc.wantErrSub)
+				}
+			})
+		}
+	})
+
+	t.Run("reenable preserves linkUpStableDelay settle after DL_Down to DL_Active", func(t *testing.T) {
+		saveHooks(t)
+		linkStatusPollInterval = 1 * time.Millisecond
+		linkUpTimeout = 100 * time.Millisecond
+		linkDownTimeout = 100 * time.Millisecond
+		linkUpStableDelay = 25 * time.Millisecond
+
+		disabled := false
+		pciReadWord = func(_ pci.Dev, addr int32) uint16 {
+			switch addr {
+			case dspCap + offLnkCtl:
+				if disabled {
+					return lnkCtlDisable
+				}
+				return 0
+			case dspCap + offLnkSta:
+				if disabled {
+					return 0
+				}
+				return lnkStaDLAct | lnkStaSpeedGen5
+			case uspCap + offLnkSta:
+				if disabled {
+					return lnkdownUspLnkSta
+				}
+				return lnkStaDLAct | lnkStaSpeedGen5
+			default:
+				return 0
+			}
+		}
+		pciWriteWord = func(_ pci.Dev, addr int32, val uint16) {
+			if addr == dspCap+offLnkCtl {
+				disabled = (val & lnkCtlDisable) != 0
+			}
+		}
+
+		start := time.Now()
+		if err := newLinktest().reenable(); err != nil {
+			t.Fatalf("reenable() unexpected error: %v", err)
+		}
+		if elapsed := time.Since(start); elapsed < linkUpStableDelay {
+			t.Errorf("reenable() took %v, want >= linkUpStableDelay (%v)", elapsed, linkUpStableDelay)
 		}
 	})
 }
