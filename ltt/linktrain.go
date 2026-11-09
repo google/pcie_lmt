@@ -135,6 +135,10 @@ type Linktest struct {
 	// Wait time related settings.
 	reenableWaitAfterDisable time.Duration
 	sbrWaitTrainTime         time.Duration // Wait time for SBR to complete training.
+	linkStatusPollInterval   time.Duration
+	linkUpTimeout            time.Duration
+	linkUpStableDelay        time.Duration
+	linkDownTimeout          time.Duration
 
 	info      string
 	Cfg       *pb.LinkTrain
@@ -148,40 +152,96 @@ type Linktest struct {
 }
 
 // //////////////////////////////////////////////////////////////////////////////
-// retrain issues a Link Retrain. It returns true if the link comes up within the timeout, and
-// false otherwise.
+// retrain issues a Link Retrain and polls until the Recovery state completes and the link is back
+// in L0 at or above its initial speed.
 func (lt *Linktest) retrain() error {
-	dsp := lt.Dsp
-	addr := lt.dspPCIeCapOffset + C.PCI_EXP_LNKCTL
-	preResetSpeed := lt.dspLinkSpeed()
-	val := pci.ReadWord(dsp, addr)
-	pci.WriteWord(dsp, addr, val|C.PCI_EXP_LNKCTL_RETRAIN)
-	return lt.pollLinkUp(preResetSpeed)
+	return lt.retrainLink(false)
 }
 
-// retrainWithEQ sets the Perform Equalization bit in the Link Control 3 Register,
-// then issues a Link Retrain. It returns true if the link comes up within the timeout, and
-// false otherwise.
+// retrainWithEQ sets the Perform Equalization bit in the Link Control 3 Register, then issues a
+// Link Retrain and polls until equalization and Recovery complete.
 func (lt *Linktest) retrainWithEQ() error {
+	return lt.retrainLink(true)
+}
+
+// retrainLink executes the PCIe Base Specification Link Retrain handshake (optionally requesting
+// Link Equalization first):
+//  1. Wait for Link Training (PCI_EXP_LNKSTA_TRAIN) to be 0b before writing control bits.
+//  2. Clear Link Bandwidth Management Status (PCI_EXP_LNKSTA_BWMGMT, RW1C) when Link Bandwidth
+//     Notification Capability (PCI_EXP_LNKCAP_LBNC) is supported on the Downstream Port.
+//  3. Optionally set Perform Equalization (PCI_SEC_LNKCTL3_PERFORM_LINK_EQU) in Link Control 3.
+//  4. Set Retrain Link (PCI_EXP_LNKCTL_RETRAIN) in Link Control.
+//  5. Poll until hardware signals Recovery completion (BWMGMT == 1b when LBNC is supported,
+//     Link Training == 0b, DL_Active == 1b, and USP/DSP link speeds >= pre-retrain speed).
+func (lt *Linktest) retrainLink(withEQ bool) error {
 	dsp := lt.Dsp
 
-	// Find the Secondary PCI Express Extended Capability.
-	secOffset, err := pci.FindCapability(dsp, uint16(C.PCI_EXT_CAP_ID_SECPCI), uint32(C.PCI_CAP_EXTENDED))
-	if err != nil {
-		log.Errorf("BDF:[%s]: failed to find Secondary PCIe Extended Cap: %v", dsp.BDFString(), err)
-		return &TrainError{Code: ErrSecPCIeExtCapNotFound, Message: err.Error()}
+	var secOffset int32
+	if withEQ {
+		var err error
+		secOffset, err = pciFindCapability(dsp, uint16(C.PCI_EXT_CAP_ID_SECPCI), uint32(C.PCI_CAP_EXTENDED))
+		if err != nil {
+			log.Errorf("BDF:[%s]: failed to find Secondary PCIe Extended Cap: %v", dsp.BDFString(), err)
+			return &TrainError{Code: ErrSecPCIeExtCapNotFound, Message: err.Error()}
+		}
 	}
 
-	// Read Link Control 3 Register.
-	lnkctl3Addr := secOffset + C.PCI_SEC_LNKCTL3
-	lnkctl3Val := pci.ReadWord(dsp, lnkctl3Addr)
+	if err := lt.pollNotTraining(); err != nil {
+		return err
+	}
 
-	// Set Perform Equalization bit (Bit 0).
-	pci.WriteWord(dsp, lnkctl3Addr, lnkctl3Val|C.PCI_SEC_LNKCTL3_PERFORM_LINK_EQU)
-	log.V(2).Infof("BDF:[%s]: Set Perform Equalization bit (addr 0x%x, val 0x%x)", dsp.BDFString(), lnkctl3Addr, lnkctl3Val|C.PCI_SEC_LNKCTL3_PERFORM_LINK_EQU)
+	preResetSpeed := lt.dspLinkSpeed()
 
-	// Perform standard retrain by calling retrain().
-	return lt.retrain()
+	lnkctlAddr := lt.dspPCIeCapOffset + C.PCI_EXP_LNKCTL
+	origLnkctl := pciReadWord(dsp, lnkctlAddr)
+
+	hasLBNC, cleanup := lt.setupLBNC(origLnkctl, lnkctlAddr)
+	defer cleanup()
+
+	if withEQ {
+		lnkctl3Addr := secOffset + C.PCI_SEC_LNKCTL3
+		lnkctl3Val := pciReadWord(dsp, lnkctl3Addr)
+		pciWriteWord(dsp, lnkctl3Addr, lnkctl3Val|C.PCI_SEC_LNKCTL3_PERFORM_LINK_EQU)
+		log.V(2).Infof("BDF:[%s]: Set Perform Equalization bit (addr 0x%x, val 0x%x)",
+			dsp.BDFString(), lnkctl3Addr, lnkctl3Val|C.PCI_SEC_LNKCTL3_PERFORM_LINK_EQU)
+	}
+
+	pciWriteWord(dsp, lnkctlAddr, (origLnkctl&^uint16(C.PCI_EXP_LNKCTL_BWMIE))|C.PCI_EXP_LNKCTL_RETRAIN)
+
+	if !hasLBNC {
+		return lt.pollLinkUp(preResetSpeed)
+	}
+	return lt.pollRetrainComplete(preResetSpeed)
+}
+
+// setupLBNC checks whether the Downstream Port supports Link Bandwidth Notification Capability
+// (PCI_EXP_LNKCAP_LBNC). When supported, it temporarily masks PCI_EXP_LNKCTL_BWMIE if set, clears
+// PCI_EXP_LNKSTA_BWMGMT (RW1C), and returns a cleanup callback that clears BWMGMT and restores
+// Link Control on return.
+func (lt *Linktest) setupLBNC(origLnkctl uint16, lnkctlAddr int32) (hasLBNC bool, cleanup func()) {
+	hasLBNC = (pciReadLong(lt.Dsp, lt.dspPCIeCapOffset+C.PCI_EXP_LNKCAP) & C.PCI_EXP_LNKCAP_LBNC) != 0
+	if !hasLBNC {
+		return false, func() {}
+	}
+
+	cleanup = func() {}
+	if (origLnkctl & C.PCI_EXP_LNKCTL_BWMIE) != 0 {
+		// Temporarily mask Link Bandwidth Management Interrupt Enable during retrain so an OS
+		// bandwidth-notification ISR cannot clear BWMGMT before polling observes it.
+		pciWriteWord(lt.Dsp, lnkctlAddr, origLnkctl&^uint16(C.PCI_EXP_LNKCTL_BWMIE))
+		cleanup = func() {
+			// Clear BWMGMT (RW1C) before restoring BWMIE so (BWMIE && BWMGMT) does not transition
+			// 0 -> 1 on return and trigger a deferred bandwidth-notification ISR during the next
+			// retrain iteration.
+			pciWriteWord(lt.Dsp, lt.dspPCIeCapOffset+C.PCI_EXP_LNKSTA, uint16(C.PCI_EXP_LNKSTA_BWMGMT))
+			pciWriteWord(lt.Dsp, lnkctlAddr, origLnkctl&^uint16(C.PCI_EXP_LNKCTL_RETRAIN))
+		}
+	}
+	// Write only PCI_EXP_LNKSTA_BWMGMT (RW1C) rather than read-modify-writing Link Status so
+	// PCI_EXP_LNKSTA_AUTBW (also RW1C) is not inadvertently cleared.
+	pciWriteWord(lt.Dsp, lt.dspPCIeCapOffset+C.PCI_EXP_LNKSTA, uint16(C.PCI_EXP_LNKSTA_BWMGMT))
+
+	return true, cleanup
 }
 
 // secondaryBusReset issues a Secondary Bus Reset on a link. It returns true if the link comes up
@@ -204,7 +264,7 @@ func (lt *Linktest) secondaryBusReset() error {
 				"Link speed mismatch (dsp: 0x%x, usp: 0x%x)", dspPresetSpeed, uspPresetSpeed),
 		}
 	}
-	origDspBridgeCtrl := pci.ReadWord(lt.Dsp, C.PCI_BRIDGE_CONTROL)
+	origDspBridgeCtrl := pciReadWord(lt.Dsp, C.PCI_BRIDGE_CONTROL)
 	if origDspBridgeCtrl&C.PCI_BRIDGE_CTL_BUS_RESET != 0 {
 		log.Warningf("BDF:[%s]: SBR bit is already set (origDspBridgeCtrl: 0x%x)",
 			lt.Cfg.GetUspBdf(), origDspBridgeCtrl)
@@ -212,8 +272,8 @@ func (lt *Linktest) secondaryBusReset() error {
 
 	// Sets and clears the Secondary Bus Reset bit.
 	log.V(2).Infof("BDF:[%s]: Write SBR=1 to PCI_BRIDGE_CONTROL", lt.Cfg.GetUspBdf())
-	pci.WriteWord(lt.Dsp, C.PCI_BRIDGE_CONTROL, origDspBridgeCtrl|C.PCI_BRIDGE_CTL_BUS_RESET)
-	newDspBridgeCtrl := pci.ReadWord(lt.Dsp, C.PCI_BRIDGE_CONTROL) // Read-after-write to ensure effective write.
+	pciWriteWord(lt.Dsp, C.PCI_BRIDGE_CONTROL, origDspBridgeCtrl|C.PCI_BRIDGE_CTL_BUS_RESET)
+	newDspBridgeCtrl := pciReadWord(lt.Dsp, C.PCI_BRIDGE_CONTROL) // Read-after-write to ensure effective write.
 	if newDspBridgeCtrl&C.PCI_BRIDGE_CTL_BUS_RESET == 0 {
 		log.Errorf("BDF:[%s]: Failed to set SBR bit (newDspBridgeCtrl: 0x%x, origDspBridgeCtrl: 0x%x)",
 			lt.Cfg.GetUspBdf(), newDspBridgeCtrl, origDspBridgeCtrl)
@@ -229,8 +289,8 @@ func (lt *Linktest) secondaryBusReset() error {
 
 	// Wait for a teardown time and clears the Secondary Bus Reset bit.
 	time.Sleep(Teardownwait)
-	pci.WriteWord(lt.Dsp, C.PCI_BRIDGE_CONTROL, origDspBridgeCtrl&^C.PCI_BRIDGE_CTL_BUS_RESET)
-	newDspBridgeCtrl = pci.ReadWord(lt.Dsp, C.PCI_BRIDGE_CONTROL) // Read-after-write to ensure effective write.
+	pciWriteWord(lt.Dsp, C.PCI_BRIDGE_CONTROL, origDspBridgeCtrl&^C.PCI_BRIDGE_CTL_BUS_RESET)
+	newDspBridgeCtrl = pciReadWord(lt.Dsp, C.PCI_BRIDGE_CONTROL) // Read-after-write to ensure effective write.
 	if newDspBridgeCtrl&C.PCI_BRIDGE_CTL_BUS_RESET != 0 {
 		log.Errorf("BDF:[%s]: Failed to clear SBR bit (newDspBridgeCtrl: 0x%x, origDspBridgeCtrl: 0x%x)",
 			lt.Cfg.GetUspBdf(), newDspBridgeCtrl, origDspBridgeCtrl)
@@ -287,7 +347,7 @@ func (lt *Linktest) reenable() error {
 				"Link speed mismatch (dsp: 0x%x, usp: 0x%x)", dspPresetSpeed, uspPresetSpeed),
 		}
 	}
-	origLnkCtl := pci.ReadWord(lt.Dsp, lnkctlAddr)
+	origLnkCtl := pciReadWord(lt.Dsp, lnkctlAddr)
 	if origLnkCtl&C.PCI_EXP_LNKCTL_DISABLE != 0 {
 		log.Warningf("BDF:[%s]: Link is already disabled, (origLnkCtl: 0x%x)",
 			lt.Cfg.GetUspBdf(), origLnkCtl)
@@ -295,7 +355,7 @@ func (lt *Linktest) reenable() error {
 
 	// Disable the link and poll until the link is down.
 	log.V(2).Infof("BDF:[%s]: Write Disable=1 to Link Control Register", lt.Cfg.GetUspBdf())
-	pci.WriteWord(lt.Dsp, lnkctlAddr, origLnkCtl|C.PCI_EXP_LNKCTL_DISABLE)
+	pciWriteWord(lt.Dsp, lnkctlAddr, origLnkCtl|C.PCI_EXP_LNKCTL_DISABLE)
 	log.V(2).Infof("BDF:[%s]: Start polling until link is down", lt.Cfg.GetUspBdf())
 	lnkDownErr := lt.pollLinkDisabled()
 	if lnkDownErr != nil {
@@ -307,7 +367,7 @@ func (lt *Linktest) reenable() error {
 	// Re-enable the link and poll until the link is up.
 	// This should always be done no matter if the link down was successful or not.
 	log.V(2).Infof("BDF:[%s]: Write Disable=0 to Link Control Register", lt.Cfg.GetUspBdf())
-	pci.WriteWord(lt.Dsp, lnkctlAddr, origLnkCtl)
+	pciWriteWord(lt.Dsp, lnkctlAddr, origLnkCtl)
 	log.V(2).Infof("BDF:[%s]: Start polling until link is up", lt.Cfg.GetUspBdf())
 	lnkUpErr := lt.pollLinkUp(uspPresetSpeed)
 	if lnkUpErr != nil {
@@ -326,7 +386,7 @@ func (lt *Linktest) reenable() error {
 
 // dspLinkSpeed returns the current link speed of the DSP.
 func (lt *Linktest) dspLinkSpeed() uint16 {
-	staVal := pci.ReadWord(lt.Dsp, lt.dspPCIeCapOffset+C.PCI_EXP_LNKSTA)
+	staVal := pciReadWord(lt.Dsp, lt.dspPCIeCapOffset+C.PCI_EXP_LNKSTA)
 	speed := staVal & C.PCI_EXP_LNKSTA_SPEED
 	return speed
 }
@@ -334,7 +394,7 @@ func (lt *Linktest) dspLinkSpeed() uint16 {
 // uspLinkSpeed returns the current link speed of the USP.
 // Returns ErrLinkDown if the link is down (USP link status value is 0xffff).
 func (lt *Linktest) uspLinkSpeed() (uint16, error) {
-	staVal := pci.ReadWord(lt.Usp, lt.uspPCIeCapOffset+C.PCI_EXP_LNKSTA)
+	staVal := pciReadWord(lt.Usp, lt.uspPCIeCapOffset+C.PCI_EXP_LNKSTA)
 	if staVal == lnkdownUspLnkSta {
 		return 0, &TrainError{Code: ErrLinkDown, Message: "Failed to read USP link speed due to 0xffff"}
 	}
@@ -342,10 +402,12 @@ func (lt *Linktest) uspLinkSpeed() (uint16, error) {
 }
 
 var (
-	pciReadByte = pci.ReadByte
-	pciReadWord = pci.ReadWord
-	pciReadLong = pci.ReadLong
-	findDSP     = (pci.Dev).FindDSP
+	pciReadByte       = pci.ReadByte
+	pciReadWord       = pci.ReadWord
+	pciReadLong       = pci.ReadLong
+	pciWriteWord      = pci.WriteWord
+	pciFindCapability = pci.FindCapability
+	findDSP           = (pci.Dev).FindDSP
 )
 
 func devBDF(dev pci.Dev) string {
@@ -763,6 +825,10 @@ var getLinks = func(devs pci.Dev, cfg *pb.LinkTrain) ([]*Linktest, error) {
 			lt.Cfg.ReenableWaitMsAfterDisable = uint32(defaultReenableWaitAfterDisable.Milliseconds())
 		}
 		lt.reenableWaitAfterDisable = time.Duration(lt.Cfg.GetReenableWaitMsAfterDisable()) * time.Millisecond
+		lt.linkStatusPollInterval = defaultLinkStatusPollInterval
+		lt.linkUpTimeout = defaultLinkUpTimeout
+		lt.linkUpStableDelay = defaultLinkUpStableDelay
+		lt.linkDownTimeout = defaultLinkDownTimeout
 
 		linktests = append(linktests, &lt)
 	}

@@ -27,19 +27,18 @@ import (
 	"time"
 
 	log "github.com/golang/glog"
-	pci "pciutils"
 )
 
 const (
-	// Polling timeouts and intervals for link training optimization
-	linkStatusPollInterval = 1 * time.Millisecond
-	linkUpTimeout          = 5 * time.Second
-	linkUpStableDelay      = 100 * time.Millisecond
-	linkDownTimeout        = 1 * time.Second
-
 	// lnkdownUspLnkSta is the value we will get from the Upstream Port (Device Side) Link Status
 	// Register when the device is unreachable.
 	lnkdownUspLnkSta = uint16(0xffff)
+
+	// Default polling timeouts and intervals for link training.
+	defaultLinkStatusPollInterval = 1 * time.Millisecond
+	defaultLinkUpTimeout          = 5 * time.Second
+	defaultLinkUpStableDelay      = 100 * time.Millisecond
+	defaultLinkDownTimeout        = 1 * time.Second
 )
 
 // linkUpState holds the PCIe config register values read during link-up polling.
@@ -86,10 +85,10 @@ func pollUntil[T any](lt *Linktest, readWords func() T, until func(T) string, ti
 }
 
 func (lt *Linktest) getLinkUpState() linkUpState {
-	dspLnksta := pci.ReadWord(lt.Dsp, lt.dspPCIeCapOffset+C.PCI_EXP_LNKSTA)
+	dspLnksta := pciReadWord(lt.Dsp, lt.dspPCIeCapOffset+C.PCI_EXP_LNKSTA)
 	// Debug only log (v=3).
 	log.V(3).Infof("BDF:[%s]: pollLinkUp: read dsplnksta=0x%04x", lt.Cfg.GetUspBdf(), dspLnksta)
-	uspLnksta := pci.ReadWord(lt.Usp, lt.uspPCIeCapOffset+C.PCI_EXP_LNKSTA)
+	uspLnksta := pciReadWord(lt.Usp, lt.uspPCIeCapOffset+C.PCI_EXP_LNKSTA)
 	// Debug only log (v=3).
 	log.V(3).Infof("BDF:[%s]: pollLinkUp: read usplnksta=0x%04x", lt.Cfg.GetUspBdf(), uspLnksta)
 	return linkUpState{
@@ -98,9 +97,8 @@ func (lt *Linktest) getLinkUpState() linkUpState {
 	}
 }
 
-// linkNotUpReason returns an empty string if the link is up.
-// Otherwise, returns a non-empty string describing why the link is still not up.
-func linkNotUpReason(s linkUpState, preResetSpeed uint16, uspBdf string) string {
+// linkNotUpReasons returns the individual reasons why the link is not yet up, or nil if it is up.
+func linkNotUpReasons(s linkUpState, preResetSpeed uint16) []string {
 	trainingBit := (s.dsplnksta & C.PCI_EXP_LNKSTA_TRAIN) != 0
 	dlActBit := (s.dsplnksta & C.PCI_EXP_LNKSTA_DL_ACT) != 0
 	dspCurrentSpeed := s.dsplnksta & C.PCI_EXP_LNKSTA_SPEED
@@ -126,6 +124,13 @@ func linkNotUpReason(s linkUpState, preResetSpeed uint16, uspBdf string) string 
 				"USP speed downgrade (0x%x < 0x%x)", uspCurrentSpeed, preResetSpeed))
 		}
 	}
+	return reasons
+}
+
+// linkNotUpReason returns an empty string if the link is up.
+// Otherwise, returns a non-empty string describing why the link is still not up.
+func linkNotUpReason(s linkUpState, preResetSpeed uint16, uspBdf string) string {
+	reasons := linkNotUpReasons(s, preResetSpeed)
 	if len(reasons) == 0 {
 		return ""
 	}
@@ -136,8 +141,58 @@ func linkNotUpReason(s linkUpState, preResetSpeed uint16, uspBdf string) string 
 	return ret
 }
 
+// pollNotTraining waits until the Downstream Port Link Training bit (PCI_EXP_LNKSTA_TRAIN) is 0b
+// before software writes Perform Equalization or Retrain Link (PCIe Base Spec Sec 7.5.3.7).
+func (lt *Linktest) pollNotTraining() error {
+	dspLnkstaAddr := lt.dspPCIeCapOffset + C.PCI_EXP_LNKSTA
+	readWords := func() uint16 {
+		return pciReadWord(lt.Dsp, dspLnkstaAddr)
+	}
+	notTraining := func(dsplnksta uint16) string {
+		if (dsplnksta & C.PCI_EXP_LNKSTA_TRAIN) != 0 {
+			return fmt.Sprintf("stuck in training before retrain (dsplnksta: 0x%04x)", dsplnksta)
+		}
+		return ""
+	}
+	if reason := pollUntil(lt, readWords, notTraining, lt.linkUpTimeout, lt.linkStatusPollInterval); reason != "" {
+		return &TrainError{Code: ErrLinkUpTimeout, Message: reason}
+	}
+	return nil
+}
+
+// pollRetrainComplete polls until a Link Retrain (with or without Equalization) has transitioned
+// through Recovery and returned to L0 without requiring a post-DL_Active reset settle sleep:
+//   - PCI_EXP_LNKSTA_BWMGMT == 1b, proving hardware completed the requested Link Retrain Recovery
+//     cycle rather than returning a stale pre-Recovery L0 read.
+//   - PCI_EXP_LNKSTA_TRAIN == 0b, PCI_EXP_LNKSTA_DL_ACT == 1b, USP Link Status != 0xffff, and both
+//     DSP and USP Current Link Speeds >= preResetSpeed.
+func (lt *Linktest) pollRetrainComplete(preResetSpeed uint16) error {
+	readWords := func() linkUpState {
+		return lt.getLinkUpState()
+	}
+	retrainDone := func(s linkUpState) string {
+		var reasons []string
+		if (s.dsplnksta & C.PCI_EXP_LNKSTA_BWMGMT) == 0 {
+			reasons = append(reasons, "retrain recovery not yet completed (BWMGMT=0)")
+		}
+		reasons = append(reasons, linkNotUpReasons(s, preResetSpeed)...)
+		if len(reasons) == 0 {
+			return ""
+		}
+		ret := fmt.Sprintf("%s (dsplnksta: 0x%04x, usplnksta: 0x%04x)",
+			strings.Join(reasons, ", "), s.dsplnksta, s.usplnksta)
+		log.V(3).Infof("BDF:[%s]: pollRetrainComplete still not finished: %s", lt.Cfg.GetUspBdf(), ret)
+		return ret
+	}
+	if reason := pollUntil(lt, readWords, retrainDone, lt.linkUpTimeout, lt.linkStatusPollInterval); reason != "" {
+		return &TrainError{Code: ErrLinkUpTimeout, Message: reason}
+	}
+	return nil
+}
+
 // pollLinkUp polls the Link Training, Data Link Layer Link Active, and Current Link Speed bits in
-// the Link Status Register to determine if the link is up.
+// the Link Status Register to determine if the link is up, then waits lt.linkUpStableDelay (100ms
+// per PCIe Base Spec Sec 6.6.1 post-DL_Active settle after DL_Down -> DL_Active link re-enable).
 // It returns nil if the link comes up at or above preResetSpeed within the timeout, and
 // a TrainError otherwise.
 func (lt *Linktest) pollLinkUp(preResetSpeed uint16) error {
@@ -147,13 +202,13 @@ func (lt *Linktest) pollLinkUp(preResetSpeed uint16) error {
 	linkUp := func(s linkUpState) string {
 		return linkNotUpReason(s, preResetSpeed, lt.Cfg.GetUspBdf())
 	}
-	if reason := pollUntil(lt, readWords, linkUp, linkUpTimeout, linkStatusPollInterval); reason != "" {
+	if reason := pollUntil(lt, readWords, linkUp, lt.linkUpTimeout, lt.linkStatusPollInterval); reason != "" {
 		return &TrainError{Code: ErrLinkUpTimeout, Message: reason}
 	}
 	// Wait for a short time to ensure the link is stable.
 	// Debug only log (v=3).
-	log.V(3).Infof("BDF:[%s]: pollLinkUp: sleep for %v", lt.Cfg.GetUspBdf(), linkUpStableDelay)
-	time.Sleep(linkUpStableDelay)
+	log.V(3).Infof("BDF:[%s]: pollLinkUp: sleep for %v", lt.Cfg.GetUspBdf(), lt.linkUpStableDelay)
+	time.Sleep(lt.linkUpStableDelay)
 	// Debug only log (v=3).
 	log.V(3).Infof("BDF:[%s]: pollLinkUp: finished", lt.Cfg.GetUspBdf())
 	return nil
@@ -168,13 +223,13 @@ func (lt *Linktest) pollLinkDisabled() error {
 	dspLnkstaAddr := lt.dspPCIeCapOffset + C.PCI_EXP_LNKSTA
 	uspLnkstaAddr := lt.uspPCIeCapOffset + C.PCI_EXP_LNKSTA
 	readWords := func() linkDisableState {
-		dsplnkctl := pci.ReadWord(lt.Dsp, dspLnkctlAddr)
+		dsplnkctl := pciReadWord(lt.Dsp, dspLnkctlAddr)
 		// Debug only log (v=3).
 		log.V(3).Infof("BDF:[%s]: pollLinkDisabled: read dsplnkctl=0x%04x", lt.Cfg.GetUspBdf(), dsplnkctl)
-		dsplnksta := pci.ReadWord(lt.Dsp, dspLnkstaAddr)
+		dsplnksta := pciReadWord(lt.Dsp, dspLnkstaAddr)
 		// Debug only log (v=3).
 		log.V(3).Infof("BDF:[%s]: pollLinkDisabled: read dsplnksta=0x%04x", lt.Cfg.GetUspBdf(), dsplnksta)
-		usplnksta := pci.ReadWord(lt.Usp, uspLnkstaAddr)
+		usplnksta := pciReadWord(lt.Usp, uspLnkstaAddr)
 		// Debug only log (v=3).
 		log.V(3).Infof("BDF:[%s]: pollLinkDisabled: read usplnksta=0x%04x", lt.Cfg.GetUspBdf(), usplnksta)
 		return linkDisableState{
@@ -207,7 +262,7 @@ func (lt *Linktest) pollLinkDisabled() error {
 		log.V(3).Infof("BDF:[%s]: pollLinkDisabled still not finished: %s", lt.Cfg.GetUspBdf(), ret)
 		return ret
 	}
-	if reason := pollUntil(lt, readWords, linkDown, linkDownTimeout, linkStatusPollInterval); reason != "" {
+	if reason := pollUntil(lt, readWords, linkDown, lt.linkDownTimeout, lt.linkStatusPollInterval); reason != "" {
 		return &TrainError{Code: ErrDisableTimeout, Message: reason}
 	}
 	// Even SW sees the link is down, it still take some time for HW to destruct internal resources
