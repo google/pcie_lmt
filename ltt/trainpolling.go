@@ -203,6 +203,15 @@ func (lt *Linktest) pollLinkUp(preResetSpeed uint16) error {
 		return linkNotUpReason(s, preResetSpeed, lt.Cfg.GetUspBdf())
 	}
 	if reason := pollUntil(lt, readWords, linkUp, lt.linkUpTimeout, lt.linkStatusPollInterval); reason != "" {
+		// Distinguish "the upstream port never answered" from "the link came up wrong".
+		// Both end the poll, but only the latter is a statement about link speed or width.
+		// An all-ones Link Status means the device is not responding to config space access
+		// at all, so any field read against it would compare synthesized ones rather than a
+		// measurement. Reporting ErrLinkDown here keeps needFieldCheck() from running the
+		// field check, matching what secondaryBusReset() already does for the M_SBR path.
+		if lt.getLinkUpState().usplnksta == lnkdownUspLnkSta {
+			return &TrainError{Code: ErrLinkDown, Message: reason}
+		}
 		return &TrainError{Code: ErrLinkUpTimeout, Message: reason}
 	}
 	// Wait for a short time to ensure the link is stable.

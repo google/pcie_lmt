@@ -68,6 +68,8 @@ const (
 	PcieExtCapStart    = 0x100
 	configSpaceSize    = 0x100
 	extConfigSpaceSize = 0x1000
+
+	deviceUnresponsiveVerdict = "ltt-device-unresponsive"
 )
 
 var (
@@ -835,25 +837,88 @@ var getLinks = func(devs pci.Dev, cfg *pb.LinkTrain) ([]*Linktest, error) {
 	return linktests, nil
 }
 
+// checkResult is the outcome of checking an USP's config registers against the proto spec.
+type checkResult int
+
+const (
+	// checkPass means every checked field matched its expected value.
+	checkPass checkResult = iota
+	// checkFail means at least one checked field did not match its expected value.
+	checkFail
+	// checkUnreachable means a config space read returned all ones, i.e. the USP did not respond.
+	// The values read carry no information, so the link is neither known good nor known bad.
+	checkUnreachable
+)
+
+func (r checkResult) String() string {
+	switch r {
+	case checkPass:
+		return "pass"
+	case checkFail:
+		return "fail"
+	case checkUnreachable:
+		return "unreachable"
+	default:
+		return fmt.Sprintf("checkResult(%d)", int(r))
+	}
+}
+
+// isUnreachableRead reports whether raw, a config space read of the given width, came back as all
+// ones.
+//
+// When a device does not respond, the Root Complex synthesizes all ones for the read rather than
+// surfacing an error, so the caller cannot distinguish "device gone" from "register happens to
+// read all ones" except by content. Every field width this test reads has reserved bits that are
+// hardwired to zero in a responding device, so an all-ones read means the device is not there.
+// lnkdownUspLnkSta in trainpolling.go is the UINT16 case of the same value, and pollLinkUp and
+// getUspLinkSpeed already make this assumption.
+func isUnreachableRead(size pb.LinkTrain_PciConfigField_SizeEnum, raw uint32) bool {
+	switch size {
+	case pb.LinkTrain_PciConfigField_UINT8:
+		return raw == 0xff
+	case pb.LinkTrain_PciConfigField_UINT16:
+		return raw == uint32(lnkdownUspLnkSta)
+	case pb.LinkTrain_PciConfigField_UINT32:
+		return raw == 0xffffffff
+	default:
+		// Widths that check() does not read are never classified as unreachable, so that an
+		// unhandled width falls through to the normal comparison rather than silently suppressing
+		// a real mismatch.
+		return false
+	}
+}
+
 // check checks config registers of an USP against the proto spec.
-func (lt *Linktest) check(iteration int) bool {
+//
+// It stops at the first read that indicates the USP is not responding and returns
+// checkUnreachable. In that case no measurement is emitted and no field state is updated, because
+// an all-ones read is not a measurement of the link: comparing it against the spec would report a
+// simultaneous speed and width mismatch on hardware that may be perfectly healthy.
+func (lt *Linktest) check(iteration int) checkResult {
 	usp := lt.Usp
 	chks := lt.chks
-	pass := true
+	result := checkPass
 
 	for i, f := range chks {
 		var v uint32
 		var valStr string
 		switch f.GetSize() {
 		case pb.LinkTrain_PciConfigField_UINT8:
-			v = uint32(pci.ReadByte(usp, int32(f.GetAddr())))
+			v = uint32(pciReadByte(usp, int32(f.GetAddr())))
 			valStr = fmt.Sprintf("%2x", v)
 		case pb.LinkTrain_PciConfigField_UINT16:
-			v = uint32(pci.ReadWord(usp, int32(f.GetAddr())))
+			v = uint32(pciReadWord(usp, int32(f.GetAddr())))
 			valStr = fmt.Sprintf("%4x", v)
 		case pb.LinkTrain_PciConfigField_UINT32:
-			v = uint32(pci.ReadLong(usp, int32(f.GetAddr())))
+			v = uint32(pciReadLong(usp, int32(f.GetAddr())))
 			valStr = fmt.Sprintf("%8x", v)
+		}
+
+		if isUnreachableRead(f.GetSize(), v) {
+			log.Errorf("BDF:[%s]: [Iteration %4d][Field %-25s] config space read returned all ones "+
+				"(0x%s); the USP is not responding, so the link state is unknown. Not scoring this as a "+
+				"field mismatch.", lt.Cfg.GetUspBdf(), iteration, f.GetName(), valStr)
+			return checkUnreachable
 		}
 
 		mSeries := &ocppb.MeasurementSeriesElement{
@@ -877,11 +942,11 @@ func (lt *Linktest) check(iteration int) bool {
 				log.Errorf("BDF:[%s]: [Iteration %4d][Field %-25s] Field check missing expected value", lt.Cfg.GetUspBdf(), iteration, f.GetName())
 			}
 			f.State = pb.LinkTrain_PciConfigField_S_ERROR
-			pass = false
+			result = checkFail
 		} else {
 			fieldPass := (f.GetMask() & f.GetExpected()) == (f.GetMask() & v)
 			if !fieldPass {
-				pass = false
+				result = checkFail
 				hexWidth := (1 << f.GetSize()) * 2
 				log.Errorf("BDF:[%s]: [Iteration %4d][Field %-25s] Field check mismatch: actual 0x%0*x, expected 0x%0*x (state %s)",
 					lt.Cfg.GetUspBdf(), iteration, f.GetName(), hexWidth, f.GetMask()&v, hexWidth, f.GetMask()&f.GetExpected(), f.GetState())
@@ -897,7 +962,7 @@ func (lt *Linktest) check(iteration int) bool {
 			}
 		}
 	}
-	return pass
+	return result
 }
 
 // log logs config register values of an USP according to the proto spec.
@@ -961,6 +1026,43 @@ func (lt *Linktest) restore() {
 			pci.WriteLong(usp, int32(f.GetAddr()), uint32(v))
 		}
 	}
+}
+
+// recordInitialCheckFail records the outcome of a failed initial check: it logs the field values,
+// marks the link failed, fills in diag and emits it. res must not be checkPass.
+//
+// checkUnreachable and checkFail are kept apart because they support different repair actions. An
+// unresponsive device produced no measurement at all, so the pass and fail counts are deliberately
+// left alone: no iteration ran and no field was observed, so there is nothing to count.
+func (lt *Linktest) recordInitialCheckFail(res checkResult, diag *ocppb.Diagnosis) {
+	lt.log()
+	lt.Pass = false
+	diag.Type = ocppb.Diagnosis_FAIL
+
+	switch res {
+	case checkUnreachable:
+		log.Warningf("BDF:[%s]: device not responding during initial checking: %v", lt.Cfg.GetUspBdf(), lt)
+		diag.Verdict = deviceUnresponsiveVerdict
+		diag.Message = fmt.Sprintf("%s device did not respond to config space access "+
+			"during LTT initial checking: the read returned all ones. The link state is unknown "+
+			"and no field check was performed", lt.hwinfo)
+	default:
+		failCnt := lt.Cfg.GetFailCount() + 1
+		lt.Cfg.FailCount = &failCnt
+		log.Warningf("BDF:[%s]: Initial checking failed: %v", lt.Cfg.GetUspBdf(), lt)
+		diag.Verdict = "ltt-initial-checking-failed"
+		diag.Message = fmt.Sprintf("%s link failed LTT initial checking: pass_count=%d; fail_count=%d",
+			lt.hwinfo, lt.Cfg.GetPassCount(), lt.Cfg.GetFailCount())
+	}
+
+	outputArtifact(&ocppb.OutputArtifact{
+		Artifact: &ocppb.OutputArtifact_TestStepArtifact{
+			TestStepArtifact: &ocppb.TestStepArtifact{
+				Artifact:   &ocppb.TestStepArtifact_Diagnosis{Diagnosis: diag},
+				TestStepId: lt.hwinfo,
+			},
+		},
+	})
 }
 
 // trainLoop trains one link iteratively.
@@ -1040,28 +1142,23 @@ var trainLoop = func(lt *Linktest) {
 		HardwareInfoId: lt.hwinfo,
 	}
 
-	// Initial checking: If fails, quit testing.
-	if !lt.check(-1) {
-		lt.log()
-		failCnt := cfg.GetFailCount() + 1
-		cfg.FailCount = &failCnt
-		lt.Pass = false
-		log.Warningf("BDF:[%s]: Initial checking failed: %v", lt.Cfg.GetUspBdf(), lt)
-
-		diag.Type = ocppb.Diagnosis_FAIL
-		diag.Verdict = "ltt-initial-checking-failed"
-		diag.Message = fmt.Sprintf("%s link failed LTT initial checking: pass_count=%d; fail_count=%d",
-			lt.hwinfo, cfg.GetPassCount(), cfg.GetFailCount())
-		stepArti = &ocppb.TestStepArtifact{
-			Artifact:   &ocppb.TestStepArtifact_Diagnosis{Diagnosis: diag},
-			TestStepId: lt.hwinfo,
-		}
-		outArti = &ocppb.OutputArtifact{
-			Artifact: &ocppb.OutputArtifact_TestStepArtifact{TestStepArtifact: stepArti},
-		}
-		outputArtifact(outArti)
+	// Initial checking: If it fails, quit testing.
+	//
+	// The unreachable branch is defensive rather than load-bearing. A device that was already
+	// absent at enumeration is filtered out by getLinks, since its Vendor ID reads all ones and
+	// fails vidChk. But getLinks runs once for the whole test and trainLoop then runs per link,
+	// concurrently when parallel is set, so neighbouring ports are being disabled and re-enabled
+	// while this link reaches its own initial check. Handling it costs a branch and fails safe.
+	if res := lt.check(-1); res != checkPass {
+		lt.recordInitialCheckFail(res, diag)
 		return
 	}
+
+	// Set on the iteration that finds the device off the bus, which is always the last iteration
+	// to run since the loop breaks as soon as it is set. It decides the verdict: a run whose only
+	// failure was an unresponsive device has not demonstrated a link defect, so it must not be
+	// reported as one.
+	deviceUnresponsive := false
 
 	for i := 0; i < itr; i++ {
 		timeBeforeIteration := time.Now()
@@ -1081,11 +1178,20 @@ var trainLoop = func(lt *Linktest) {
 			log.Errorf("BDF:[%s]: Link training failed (time spent: %v): %v",
 				lt.Cfg.GetUspBdf(), iterationDuration, trainErr)
 		}
+		// A device that is not answering reaches us two ways: as ErrLinkDown from the training
+		// method, which is the usual path now that pollLinkUp classifies a persistently all-ones
+		// Link Status, or from check() below on the paths where no training error was raised.
 		checkPassed := true
+		deviceUnresponsive = isLinkDown(trainErr)
 		if trainErr == nil || needFieldCheck(trainErr) {
-			checkPassed = lt.check(i)
+			switch lt.check(i) {
+			case checkFail:
+				checkPassed = false
+			case checkUnreachable:
+				deviceUnresponsive = true
+			}
 		}
-		if trainErr != nil || !checkPassed {
+		if trainErr != nil || !checkPassed || deviceUnresponsive {
 			// Always logs the first failure.
 			if cfg.GetFailCount() == 0 {
 				lt.log()
@@ -1095,6 +1201,17 @@ var trainLoop = func(lt *Linktest) {
 			// By default, continues testing after the first failure, unless
 			// continue is set to false.
 			if cfg.Continue != nil && !cfg.GetContinue() {
+				break
+			}
+			// Once config space reads come back all ones the device is off the bus, and nothing
+			// this side of the link can bring it back: there is no path for the CPU to reach a
+			// device that is not decoding config transactions. Every remaining iteration would
+			// spend the full linkUpTimeout and report the same thing, so stop regardless of
+			// continue.
+			if deviceUnresponsive {
+				log.Warningf("BDF:[%s]: device stopped responding to config space access; "+
+					"stopping after iteration %d of %d. The link cannot be measured or recovered "+
+					"from here.", lt.Cfg.GetUspBdf(), i, itr)
 				break
 			}
 		} else {
@@ -1112,6 +1229,17 @@ var trainLoop = func(lt *Linktest) {
 		diag.Type = ocppb.Diagnosis_PASS
 		diag.Verdict = "ltt-passed"
 		diag.Message = fmt.Sprintf("%s link passed LTT: pass_count=%d; fail_count=%d",
+			lt.hwinfo, cfg.GetPassCount(), cfg.GetFailCount())
+	} else if deviceUnresponsive && cfg.GetFailCount() == 1 {
+		// The loop breaks on the unresponsive iteration, so that iteration is always the last and
+		// fail_count == 1 means it was the only failure of the run: nothing was ever observed
+		// about link speed or width, and reporting ltt-failed would claim a defect that was never
+		// seen. A run that saw a real mismatch first and then lost the device keeps ltt-failed.
+		diag.Type = ocppb.Diagnosis_FAIL
+		diag.Verdict = deviceUnresponsiveVerdict
+		diag.Message = fmt.Sprintf("%s device stopped responding to config space access "+
+			"during LTT: every read returned all ones. The link state is unknown: "+
+			"pass_count=%d; fail_count=%d",
 			lt.hwinfo, cfg.GetPassCount(), cfg.GetFailCount())
 	} else {
 		diag.Type = ocppb.Diagnosis_FAIL

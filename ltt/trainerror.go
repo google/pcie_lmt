@@ -103,3 +103,14 @@ func needFieldCheck(err error) bool {
 	}
 	return false
 }
+
+// isLinkDown reports whether the error indicates the device stopped responding to config space
+// access, i.e. every read came back as all ones. Such an iteration says nothing about link speed
+// or width, so the train loop reports it separately from a genuine field mismatch.
+//
+// errors.As already returns false for a nil error. The te != nil check is still required: a
+// typed-nil *TrainError wrapped in a non-nil error interface matches errors.As.
+func isLinkDown(err error) bool {
+	var te *TrainError
+	return errors.As(err, &te) && te != nil && te.Code == ErrLinkDown
+}

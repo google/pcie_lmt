@@ -1941,3 +1941,180 @@ func TestRetrainHandshake(t *testing.T) {
 		}
 	})
 }
+
+// TestIsUnreachableRead covers the all-ones classification per field width. The UINT64 case must
+// stay false: check() never reads that width, and returning true there would silently suppress a
+// real mismatch.
+func TestIsUnreachableRead(t *testing.T) {
+	testCases := []struct {
+		name string
+		size pb.LinkTrain_PciConfigField_SizeEnum
+		raw  uint32
+		want bool
+	}{
+		{name: "uint8 all ones", size: pb.LinkTrain_PciConfigField_UINT8, raw: 0xff, want: true},
+		{name: "uint8 normal", size: pb.LinkTrain_PciConfigField_UINT8, raw: 0x05, want: false},
+		{name: "uint16 all ones", size: pb.LinkTrain_PciConfigField_UINT16, raw: 0xffff, want: true},
+		{name: "uint16 normal", size: pb.LinkTrain_PciConfigField_UINT16, raw: 0x1105, want: false},
+		{name: "uint16 low byte all ones", size: pb.LinkTrain_PciConfigField_UINT16, raw: 0x00ff, want: false},
+		{name: "uint32 all ones", size: pb.LinkTrain_PciConfigField_UINT32, raw: 0xffffffff, want: true},
+		{name: "uint32 low word all ones", size: pb.LinkTrain_PciConfigField_UINT32, raw: 0x0000ffff, want: false},
+		{name: "uint64 is never unreachable", size: pb.LinkTrain_PciConfigField_UINT64, raw: 0xffffffff, want: false},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isUnreachableRead(tc.size, tc.raw); got != tc.want {
+				t.Errorf("isUnreachableRead(%v, 0x%x) = %v, want %v", tc.size, tc.raw, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestCheckClassifiesUnreachableUsp uses two checked fields, Speed and Width, which are both
+// 16-bit reads at offset 0x92. An unreachable USP returns 0xffff, which masks to 0x000f against
+// the Speed mask and 0x03f0 against the Width mask, so before the guard was added a single
+// unanswered read was scored as a simultaneous speed and width mismatch.
+func TestCheckClassifiesUnreachableUsp(t *testing.T) {
+	origReadWord := pciReadWord
+	defer func() { pciReadWord = origReadWord }()
+
+	// check() streams measurement elements on the pass and fail paths, so give it a pipe to write
+	// to and drain it in the background.
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe() failed: %v", err)
+	}
+	drained := make(chan struct{})
+	go func() {
+		io.Copy(io.Discard, r)
+		close(drained)
+	}()
+	OcpInit(w, "test_name", "1.0", "test_cmd")
+	defer func() {
+		w.Close()
+		<-drained
+		r.Close()
+	}()
+
+	testCases := []struct {
+		name string
+		read uint16
+		want checkResult
+	}{
+		{name: "gen5 x16 as specified", read: 0x1105, want: checkPass},
+		{name: "gen4 downtrain is a real failure", read: 0x1104, want: checkFail},
+		{name: "unreachable usp is not a failure", read: 0xffff, want: checkUnreachable},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			pciReadWord = func(dev pci.Dev, addr int32) uint16 { return tc.read }
+			lt := &Linktest{
+				Cfg: &pb.LinkTrain{UspBdf: proto.String("0000:00:00.0")},
+				chks: []*pb.LinkTrain_PciConfigField{
+					{
+						Name:     "Speed",
+						State:    pb.LinkTrain_PciConfigField_S_CHECK,
+						Addr:     0x92,
+						Size:     pb.LinkTrain_PciConfigField_UINT16,
+						Mask:     0x000F,
+						Expected: proto.Uint32(0x0005),
+					},
+					{
+						Name:     "Width",
+						State:    pb.LinkTrain_PciConfigField_S_CHECK,
+						Addr:     0x92,
+						Size:     pb.LinkTrain_PciConfigField_UINT16,
+						Mask:     0x03F0,
+						Expected: proto.Uint32(0x0100),
+					},
+				},
+				seriesID:  []string{"speed", "width"},
+				seriesCnt: []int32{0, 0},
+			}
+			if got := lt.check(0); got != tc.want {
+				t.Errorf("check() with config space reading 0x%04x = %v, want %v", tc.read, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestCheckDoesNotEmitMeasurementsWhenUnreachable guards the reason check() returns early rather
+// than recording the all-ones value: the measurement series carries a strict EQUAL validator, so
+// emitting a known-meaningless value would fail the test through a different path.
+func TestCheckDoesNotEmitMeasurementsWhenUnreachable(t *testing.T) {
+	origReadWord := pciReadWord
+	defer func() { pciReadWord = origReadWord }()
+	pciReadWord = func(dev pci.Dev, addr int32) uint16 { return 0xffff }
+
+	lt := &Linktest{
+		Cfg: &pb.LinkTrain{UspBdf: proto.String("0000:00:00.0")},
+		chks: []*pb.LinkTrain_PciConfigField{
+			{
+				Name:     "Speed",
+				State:    pb.LinkTrain_PciConfigField_S_CHECK,
+				Addr:     0x92,
+				Size:     pb.LinkTrain_PciConfigField_UINT16,
+				Mask:     0x000F,
+				Expected: proto.Uint32(0x0005),
+			},
+		},
+		seriesID:  []string{"speed"},
+		seriesCnt: []int32{0},
+	}
+
+	// No OcpInit here on purpose: if check() tried to emit an artifact it would write to a stale
+	// or nil pipe rather than returning early.
+	if got := lt.check(0); got != checkUnreachable {
+		t.Fatalf("check() = %v, want %v", got, checkUnreachable)
+	}
+	if lt.seriesCnt[0] != 0 {
+		t.Errorf("check() advanced seriesCnt to %d, want 0; no measurement should be recorded for an unreachable USP", lt.seriesCnt[0])
+	}
+	if lt.chks[0].State != pb.LinkTrain_PciConfigField_S_CHECK {
+		t.Errorf("check() set field state to %v, want it left at S_CHECK; an unreachable read is not evidence about the field", lt.chks[0].State)
+	}
+}
+
+// TestIsLinkDown covers the error-side classification of an unresponsive device. trainLoop uses
+// this to end the run when the training method already determined the device was not answering,
+// which is the common path: pollLinkUp now reports ErrLinkDown rather than ErrLinkUpTimeout when
+// the Link Status stays all ones.
+//
+// The nil and typed-nil cases pin the two guards in isLinkDown. errors.As handles a plain nil
+// error itself, but a nil *TrainError carried in a non-nil error interface does match errors.As,
+// so the explicit te != nil check is what keeps that from reporting a link down.
+func TestIsLinkDown(t *testing.T) {
+	testCases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "nil", err: nil, want: false},
+		{name: "typed nil TrainError", err: (*TrainError)(nil), want: false},
+		{name: "link down", err: &TrainError{Code: ErrLinkDown}, want: true},
+		{name: "link up timeout is not link down", err: &TrainError{Code: ErrLinkUpTimeout}, want: false},
+		{name: "speed mismatch is not link down", err: &TrainError{Code: ErrDspUspSpeedMismatch}, want: false},
+		{name: "disable timeout is not link down", err: &TrainError{Code: ErrDisableTimeout}, want: false},
+		{name: "non TrainError", err: errors.New("some other error"), want: false},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isLinkDown(tc.err); got != tc.want {
+				t.Errorf("isLinkDown(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestLinkDownSkipsFieldCheck pins the invariant the fix depends on. needFieldCheck gates whether
+// trainLoop calls check() after a training error. ErrLinkUpTimeout must keep returning true, since
+// a link that came up downtrained is exactly the defect LTT exists to catch, while ErrLinkDown must
+// return false so an unanswered config space read is never compared against the spec.
+func TestLinkDownSkipsFieldCheck(t *testing.T) {
+	if needFieldCheck(&TrainError{Code: ErrLinkDown}) {
+		t.Error("needFieldCheck(ErrLinkDown) = true, want false; an all-ones read is not a measurement of the link")
+	}
+	if !needFieldCheck(&TrainError{Code: ErrLinkUpTimeout}) {
+		t.Error("needFieldCheck(ErrLinkUpTimeout) = false, want true; a downtrained link still needs the field check")
+	}
+}

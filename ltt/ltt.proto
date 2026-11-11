@@ -84,6 +84,11 @@ message LinkTrain {
   optional int32 fail_count = 8;  // number of failed link training
 
   // If not set or true, the iterations continue after the first failure.
+  //
+  // This only applies while the link is still up. If config space reads come
+  // back all ones the device is off the bus and cannot be recovered from this
+  // side, so the run stops on that iteration whatever this is set to. Further
+  // iterations could not measure the link.
   optional bool continue = 9;
 
   // Link training methods
