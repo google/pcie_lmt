@@ -40,6 +40,10 @@ const (
 	ErrCapChainUnaligned
 	// ErrCapChainLoop indicates the capability linked list loops back on itself.
 	ErrCapChainLoop
+	// ErrInvalidSpeedStep indicates an M_SPEED_STEP step that cannot be trained: the two ends of
+	// the link do not both support its speed, or the link is already at that speed, so the retrain
+	// would not be observable.
+	ErrInvalidSpeedStep
 )
 
 func (c TrainErrorCode) String() string {
@@ -64,6 +68,8 @@ func (c TrainErrorCode) String() string {
 		return "capability chain has an unaligned pointer"
 	case ErrCapChainLoop:
 		return "capability chain loops"
+	case ErrInvalidSpeedStep:
+		return "invalid speed step"
 	default:
 		return "unknown training error"
 	}
@@ -87,8 +93,12 @@ func (e *TrainError) Error() string {
 
 // needFieldCheck returns true if the error indicates a training timeout (ErrLinkUpTimeout)
 // which still requires running the speed check.
+//
+// It returns false if any error in err's tree indicates the link is down, e.g. a speed step
+// timeout joined with a link down found while restoring the speed, because a field read against a
+// device that is not responding is not a measurement.
 func needFieldCheck(err error) bool {
-	if err == nil {
+	if err == nil || isLinkDown(err) {
 		return false
 	}
 	var te *TrainError
@@ -97,20 +107,36 @@ func needFieldCheck(err error) bool {
 		case ErrLinkUpTimeout:
 			return true
 		case ErrNone, ErrSecPCIeExtCapNotFound, ErrSetSBRFailed, ErrDisableTimeout, ErrLinkDown, ErrDspUspSpeedMismatch,
-			ErrPCIeCapNotFound, ErrCapChainUnaligned, ErrCapChainLoop:
+			ErrPCIeCapNotFound, ErrCapChainUnaligned, ErrCapChainLoop, ErrInvalidSpeedStep:
 			return false
 		}
 	}
 	return false
 }
 
-// isLinkDown reports whether the error indicates the device stopped responding to config space
-// access, i.e. every read came back as all ones. Such an iteration says nothing about link speed
-// or width, so the train loop reports it separately from a genuine field mismatch.
+// isLinkDown reports whether any error in err's tree indicates the device stopped responding to
+// config space access, i.e. every read came back as all ones. Such an iteration says nothing about
+// link speed or width, so the train loop reports it separately from a genuine field mismatch.
 //
-// errors.As already returns false for a nil error. The te != nil check is still required: a
-// typed-nil *TrainError wrapped in a non-nil error interface matches errors.As.
+// Unlike errors.As, which stops at the first *TrainError, it checks every *TrainError in the tree,
+// so that ErrLinkDown is not hidden behind another TrainError joined before it. A typed-nil
+// *TrainError is not a link down.
 func isLinkDown(err error) bool {
-	var te *TrainError
-	return errors.As(err, &te) && te != nil && te.Code == ErrLinkDown
+	switch e := err.(type) {
+	case nil:
+		return false
+	case *TrainError:
+		return e != nil && e.Code == ErrLinkDown
+	case interface{ Unwrap() []error }:
+		for _, wrapped := range e.Unwrap() {
+			if isLinkDown(wrapped) {
+				return true
+			}
+		}
+		return false
+	case interface{ Unwrap() error }:
+		return isLinkDown(e.Unwrap())
+	default:
+		return false
+	}
 }

@@ -43,7 +43,7 @@ var (
 	resfn          = flag.String("outpb", "result.pbtxt", "Result pbtxt file name")
 	bus            = flag.String("bus", "", "Deprecated. Use -bdf instead. A comma-separted list of bus numbers.")
 	bdf            = flag.String("bdf", "", "A comma-separted list of DDDD:BB:dd.f numbers.")
-	method         = flag.String("method", "", "Link training method: retrain, retrain_with_eq, sbr, or reenable")
+	method         = flag.String("method", "", "Link training method: retrain, retrain_with_eq, sbr, reenable, or speed_step")
 	iterations     = flag.Int("iterations", 0, "The number of link training iterations.")
 	parallel       = flag.Bool("parallel", true, "If true, tests multiple links in parallel.")
 	teardownwaitms = flag.Int("teardownwaitms", -1, "Wait in milliseconds after teardown.")
@@ -120,9 +120,17 @@ func main() {
 	case "reenable":
 		cfg.Method = pb.LinkTrain_M_REENABLE
 		log.V(0).Infoln("cfgpb.method overridden to ", pb.LinkTrain_M_REENABLE.String())
+	case "speed_step":
+		cfg.Method = pb.LinkTrain_M_SPEED_STEP
+		log.V(0).Infoln("cfgpb.method overridden to ", pb.LinkTrain_M_SPEED_STEP.String())
 	case "": // The method flag is not set.
 	default:
-		log.Exit("Unknown method: ", *method, "; expecting retrain, retrain_with_eq, sbr, or reenable.")
+		log.Exit("Unknown method: ", *method, "; expecting retrain, retrain_with_eq, sbr, reenable, or speed_step.")
+	}
+	// The speed_step parameters of a spec written for M_SPEED_STEP would fail validation under the
+	// method that overrides it.
+	if *method != "" && cfg.GetMethod() != pb.LinkTrain_M_SPEED_STEP {
+		cfg.SpeedStep = nil
 	}
 
 	// Overrides iterations from command line flags.
