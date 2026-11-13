@@ -223,6 +223,75 @@ func (lt *Linktest) pollLinkUp(preResetSpeed uint16) error {
 	return nil
 }
 
+// pollLinkSpeed polls until the link is in L0 at speed after a Target Link Speed change, or at
+// speed or higher if orHigher is set:
+//   - the DSP's PCI_EXP_LNKSTA_TRAIN is 0b, PCI_EXP_LNKSTA_DL_ACT is 1b and Current Link Speed
+//     matches;
+//   - then the USP's Current Link Speed matches too.
+//
+// The USP is read only once the DSP has settled, so that no config reads are sent across the link
+// while it is in Recovery. Link Training is not required to have been seen as 1b: the retrain can
+// complete before the first read, and the speed change itself is the proof that it happened.
+func (lt *Linktest) pollLinkSpeed(speed uint16, orHigher bool, timeout time.Duration) error {
+	dspLnkstaAddr := lt.dspPCIeCapOffset + C.PCI_EXP_LNKSTA
+	uspLnkstaAddr := lt.uspPCIeCapOffset + C.PCI_EXP_LNKSTA
+	want := fmt.Sprintf("0x%x", speed)
+	if orHigher {
+		want = ">= " + want
+	}
+	speedOK := func(got uint16) bool {
+		return got == speed || (orHigher && got > speed)
+	}
+	var last linkUpState
+	uspRead := false // Whether last.usplnksta was read.
+	readWords := func() linkUpState {
+		last = linkUpState{dsplnksta: pciReadWord(lt.Dsp, dspLnkstaAddr)}
+		uspRead = last.dsplnksta&C.PCI_EXP_LNKSTA_TRAIN == 0 &&
+			last.dsplnksta&C.PCI_EXP_LNKSTA_DL_ACT != 0 &&
+			speedOK(last.dsplnksta&C.PCI_EXP_LNKSTA_SPEED)
+		if uspRead {
+			last.usplnksta = pciReadWord(lt.Usp, uspLnkstaAddr)
+		}
+		return last
+	}
+	reached := func(s linkUpState) string {
+		var reasons []string
+		if s.dsplnksta&C.PCI_EXP_LNKSTA_TRAIN != 0 {
+			reasons = append(reasons, "in training")
+		}
+		if s.dsplnksta&C.PCI_EXP_LNKSTA_DL_ACT == 0 {
+			reasons = append(reasons, "data link not active")
+		}
+		if got := s.dsplnksta & C.PCI_EXP_LNKSTA_SPEED; !speedOK(got) {
+			reasons = append(reasons, fmt.Sprintf("DSP speed 0x%x, want %s", got, want))
+		}
+		if len(reasons) > 0 {
+			return fmt.Sprintf("%s (dsplnksta: 0x%04x)", strings.Join(reasons, ", "), s.dsplnksta)
+		}
+		if s.usplnksta == lnkdownUspLnkSta {
+			return fmt.Sprintf("USP Link Status is 0x%04x (dsplnksta: 0x%04x)", s.usplnksta, s.dsplnksta)
+		}
+		if got := s.usplnksta & C.PCI_EXP_LNKSTA_SPEED; !speedOK(got) {
+			return fmt.Sprintf("USP speed 0x%x, want %s (dsplnksta: 0x%04x, usplnksta: 0x%04x)",
+				got, want, s.dsplnksta, s.usplnksta)
+		}
+		return ""
+	}
+	if reason := pollUntil(lt, readWords, reached, timeout, lt.linkStatusPollInterval); reason != "" {
+		// As in pollLinkUp, distinguish "the upstream port stopped answering" from "the link did
+		// not reach the speed". If the DSP never settled, the USP has not been read yet, so read
+		// it once now that the poll is over.
+		if !uspRead {
+			last.usplnksta = pciReadWord(lt.Usp, uspLnkstaAddr)
+		}
+		if last.usplnksta == lnkdownUspLnkSta {
+			return &TrainError{Code: ErrLinkDown, Message: reason}
+		}
+		return &TrainError{Code: ErrLinkUpTimeout, Message: reason}
+	}
+	return nil
+}
+
 // pollLinkDisabled polls the following conditions to determine if the link is down:
 //   - DSP Link Control Register: Disable bit is 1.
 //   - DSP Link Status Register: Data Link Layer Link Active bit is 0.
