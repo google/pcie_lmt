@@ -22,9 +22,13 @@
 package linktrain
 
 /*
+ #include <stdint.h>
  #include <stdlib.h>
  #include "lib/pci.h"
  #include "lib/header.h"
+
+ // lnkcap2Speed wraps the function-like PCI_EXP_LNKCAP2_SPEED macro, which cgo cannot call.
+ static inline uint32_t lnkcap2Speed(uint32_t lnkcap2) { return PCI_EXP_LNKCAP2_SPEED(lnkcap2); }
 */
 import (
 	"C"
@@ -33,6 +37,7 @@ import (
 import (
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"slices"
 	"strings"
@@ -59,6 +64,16 @@ const (
 
 	defaultReenableWaitAfterDisable time.Duration = 150 * time.Millisecond
 	defaultSbrWaitTrainTime         time.Duration = 2000 * time.Millisecond
+
+	// defaultSpeedStepTimeout is the default time for an M_SPEED_STEP step to reach its speed.
+	defaultSpeedStepTimeout time.Duration = 100 * time.Millisecond
+
+	// Target Link Speed related constants for M_SPEED_STEP.
+
+	// lnkctl2TargetSpeedMask is the Target Link Speed field in the Link Control 2 Register.
+	//
+	// See PCIe Spec 6.4 Ch. 7.5.3.19 Link Control 2 Register.
+	lnkctl2TargetSpeedMask = uint16(0x000f)
 
 	// PCIe extended capability traversal constants.
 
@@ -141,6 +156,7 @@ type Linktest struct {
 	linkUpTimeout            time.Duration
 	linkUpStableDelay        time.Duration
 	linkDownTimeout          time.Duration
+	speedStepTimeout         time.Duration // Timeout for each M_SPEED_STEP step.
 
 	info      string
 	Cfg       *pb.LinkTrain
@@ -208,7 +224,7 @@ func (lt *Linktest) retrainLink(withEQ bool) error {
 			dsp.BDFString(), lnkctl3Addr, lnkctl3Val|C.PCI_SEC_LNKCTL3_PERFORM_LINK_EQU)
 	}
 
-	pciWriteWord(dsp, lnkctlAddr, (origLnkctl&^uint16(C.PCI_EXP_LNKCTL_BWMIE))|C.PCI_EXP_LNKCTL_RETRAIN)
+	lt.setRetrainLink(origLnkctl, C.PCI_EXP_LNKCTL_BWMIE)
 
 	if !hasLBNC {
 		return lt.pollLinkUp(preResetSpeed)
@@ -384,6 +400,167 @@ func (lt *Linktest) reenable() error {
 		return lnkDownErr
 	}
 	return lnkUpErr
+}
+
+// speedStep steps the link through the Target Link Speeds in lt.Cfg.GetSpeedStep().GetSpeeds().
+// For each step it writes the Target Link Speed in the DSP's Link Control 2 Register, sets Retrain
+// Link, and polls until the link is back in L0 at that speed. A speed change goes through Recovery
+// with the Data Link Layer up, so only the DSP is written: the endpoint is not reset and needs no
+// recovery.
+//
+// On return, including on error, the DSP's original Link Control 2 Register value is restored, and
+// the link is retrained back to its starting speed if it is not already there.
+func (lt *Linktest) speedStep() (err error) {
+	if err := lt.pollNotTraining(); err != nil {
+		return err
+	}
+	startSpeed := lt.dspLinkSpeed()
+	lnkctl2Addr := lt.dspPCIeCapOffset + C.PCI_EXP_LNKCTL2
+	origLnkctl2 := pciReadWord(lt.Dsp, lnkctl2Addr)
+
+	// Checks every step before anything is written, so that an untrainable step fails the
+	// iteration without leaving the link at a lower speed.
+	steps, err := lt.supportedSpeedSteps(startSpeed)
+	if err != nil {
+		return err
+	}
+
+	defer func() {
+		if restoreErr := lt.restoreTargetSpeed(origLnkctl2, startSpeed, isLinkDown(err)); restoreErr != nil {
+			err = errors.Join(err, restoreErr)
+		}
+	}()
+
+	for _, step := range steps {
+		if err := lt.retrainToSpeed(step); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// supportedSpeedSteps returns the speed steps of lt.Cfg that are in the Supported Link Speeds
+// Vector of both ends of the link, in order. A step that either end does not support is skipped
+// with a warning.
+//
+// It returns an error if either end has no Supported Link Speeds Vector, if no step is supported,
+// or if a step does not change the link speed, because its retrain could not be observed.
+func (lt *Linktest) supportedSpeedSteps(startSpeed uint16) ([]uint16, error) {
+	dspSpeeds, err := supportedLinkSpeeds(lt.Dsp, lt.dspPCIeCapOffset)
+	if err != nil {
+		return nil, err
+	}
+	uspSpeeds, err := supportedLinkSpeeds(lt.Usp, lt.uspPCIeCapOffset)
+	if err != nil {
+		return nil, err
+	}
+	var steps []uint16
+	prev := startSpeed
+	for _, step := range lt.Cfg.GetSpeedStep().GetSpeeds() {
+		if !dspSpeeds[step] || !uspSpeeds[step] {
+			log.Warningf("BDF:[%s]: Skipping speed step 0x%x, which is not in the Supported Link Speeds "+
+				"Vector of both ends of the link (DSP: %v, USP: %v)", lt.Cfg.GetUspBdf(), step,
+				slices.Sorted(maps.Keys(dspSpeeds)), slices.Sorted(maps.Keys(uspSpeeds)))
+			continue
+		}
+		// Every supported speed is a Supported Link Speeds Vector bit position, so it fits.
+		speed := uint16(step)
+		if speed == prev {
+			return nil, &TrainError{Code: ErrInvalidSpeedStep, Message: fmt.Sprintf(
+				"speed step 0x%x does not change the link speed 0x%x, so its retrain cannot be observed",
+				speed, prev)}
+		}
+		steps = append(steps, speed)
+		prev = speed
+	}
+	if len(steps) == 0 {
+		return nil, &TrainError{Code: ErrInvalidSpeedStep, Message: fmt.Sprintf(
+			"none of the speed steps %v is supported by both ends of the link (DSP: %v, USP: %v)",
+			lt.Cfg.GetSpeedStep().GetSpeeds(), slices.Sorted(maps.Keys(dspSpeeds)),
+			slices.Sorted(maps.Keys(uspSpeeds)))}
+	}
+	return steps, nil
+}
+
+// setRetrainLink sets Retrain Link in the DSP's Link Control Register, whose current value is
+// lnkctl, with the bits in clear cleared.
+func (lt *Linktest) setRetrainLink(lnkctl, clear uint16) {
+	pciWriteWord(lt.Dsp, lt.dspPCIeCapOffset+C.PCI_EXP_LNKCTL, (lnkctl&^clear)|C.PCI_EXP_LNKCTL_RETRAIN)
+}
+
+// retrainToSpeed sets the DSP's Target Link Speed to speed, sets Retrain Link, and polls until both
+// ends of the link are in L0 at speed, within lt.speedStepTimeout.
+func (lt *Linktest) retrainToSpeed(speed uint16) error {
+	if err := lt.pollNotTraining(); err != nil {
+		return err
+	}
+	lnkctl2Addr := lt.dspPCIeCapOffset + C.PCI_EXP_LNKCTL2
+	lnkctl2 := pciReadWord(lt.Dsp, lnkctl2Addr)
+	pciWriteWord(lt.Dsp, lnkctl2Addr, (lnkctl2&^lnkctl2TargetSpeedMask)|speed)
+
+	lnkctl := pciReadWord(lt.Dsp, lt.dspPCIeCapOffset+C.PCI_EXP_LNKCTL)
+	start := time.Now()
+	lt.setRetrainLink(lnkctl, 0)
+	err := lt.pollLinkSpeed(speed, false, lt.speedStepTimeout)
+	log.V(1).Infof("BDF:[%s]: Speed step to 0x%x took %v (err: %v)", lt.Cfg.GetUspBdf(), speed, time.Since(start), err)
+	return err
+}
+
+// restoreTargetSpeed writes origLnkctl2 back to the DSP's Link Control 2 Register. If the link is
+// then not at startSpeed, e.g. because a speed step failed, it retrains the link and polls until
+// it is back at or above startSpeed.
+//
+// It does not retrain if the link is down, as known from linkDown or from the USP's Link Status
+// reading all ones, because there is nothing to retrain and polling would only wait for the full
+// timeout.
+func (lt *Linktest) restoreTargetSpeed(origLnkctl2, startSpeed uint16, linkDown bool) error {
+	pciWriteWord(lt.Dsp, lt.dspPCIeCapOffset+C.PCI_EXP_LNKCTL2, origLnkctl2)
+	if linkDown {
+		return nil
+	}
+	if usplnksta := pciReadWord(lt.Usp, lt.uspPCIeCapOffset+C.PCI_EXP_LNKSTA); usplnksta == lnkdownUspLnkSta {
+		return &TrainError{Code: ErrLinkDown, Message: fmt.Sprintf(
+			"failed to restore the link speed: USP Link Status is 0x%04x", usplnksta)}
+	}
+	if err := lt.pollNotTraining(); err != nil {
+		return fmt.Errorf("failed to restore the link speed: %w", err)
+	}
+	if lt.dspLinkSpeed() == startSpeed {
+		return nil
+	}
+	log.Warningf("BDF:[%s]: Link speed is 0x%x after the speed steps, retraining back to 0x%x",
+		lt.Cfg.GetUspBdf(), lt.dspLinkSpeed(), startSpeed)
+	lt.setRetrainLink(pciReadWord(lt.Dsp, lt.dspPCIeCapOffset+C.PCI_EXP_LNKCTL), 0)
+	if err := lt.pollLinkSpeed(startSpeed, true, lt.linkUpTimeout); err != nil {
+		return fmt.Errorf("failed to restore the link speed: %w", err)
+	}
+	return nil
+}
+
+// supportedLinkSpeeds returns the Target Link Speeds that a port supports, as a set read from the
+// Supported Link Speeds Vector (SLSV) in its Link Capabilities 2 Register. Every speed in the set
+// is at least 1.
+//
+// It returns ErrNoSupportedLinkSpeeds if the vector is 0, which only a port compliant with PCIe 2.1
+// or earlier reports.
+//
+// See PCIe Spec 6.4 Ch. 7.5.3.18 Link Capabilities 2 Register.
+func supportedLinkSpeeds(dev pci.Dev, capOffset int32) (map[int32]bool, error) {
+	lnkcap2 := pciReadLong(dev, capOffset+C.PCI_EXP_LNKCAP2)
+	// slsv is the Supported Link Speeds Vector, where bit n set means the Target Link Speed n+1 is
+	// supported.
+	slsv := uint32(C.lnkcap2Speed(C.uint32_t(lnkcap2)))
+	if slsv == 0 {
+		return nil, &TrainError{Code: ErrNoSupportedLinkSpeeds, Message: fmt.Sprintf(
+			"device %s has no Supported Link Speeds Vector (Link Capabilities 2: 0x%08x)", devBDF(dev), lnkcap2)}
+	}
+	speeds := make(map[int32]bool)
+	for n := int32(0); slsv>>n != 0; n++ {
+		if slsv>>n&1 != 0 {
+			speeds[n+1] = true
+		}
+	}
+	return speeds, nil
 }
 
 // dspLinkSpeed returns the current link speed of the DSP.
@@ -647,6 +824,44 @@ func validateLinkTarget(target *pb.PcieLinkTarget) error {
 	return nil
 }
 
+// validateSpeedSteps returns an error if speed_step is set for a method other than M_SPEED_STEP, or
+// if M_SPEED_STEP has no speeds, a negative timeout_ms, a step below 1, or a step that repeats the
+// previous one, which would retrain without an observable speed change. Whether the link supports
+// a step is only known from its Supported Link Speeds Vector, which speedStep checks.
+func validateSpeedSteps(cfg *pb.LinkTrain) error {
+	sc := cfg.GetSpeedStep()
+	if cfg.GetMethod() != pb.LinkTrain_M_SPEED_STEP {
+		if sc != nil {
+			return fmt.Errorf("speed_step is only used by M_SPEED_STEP, not %s", cfg.GetMethod())
+		}
+		return nil
+	}
+	steps := sc.GetSpeeds()
+	if len(steps) == 0 {
+		return errors.New("M_SPEED_STEP requires speed_step.speeds")
+	}
+	if sc.GetTimeoutMs() < 0 {
+		return fmt.Errorf("speed_step.timeout_ms = %d must not be negative", sc.GetTimeoutMs())
+	}
+	for i, step := range steps {
+		if step < 1 {
+			return fmt.Errorf("speed_step.speeds[%d] = %d is not a Target Link Speed, which starts at 1", i, step)
+		}
+		if i > 0 && step == steps[i-1] {
+			return fmt.Errorf("speed_step.speeds[%d] = %d repeats the previous step, so its retrain cannot be observed", i, step)
+		}
+	}
+	return nil
+}
+
+// speedStepTimeout returns the M_SPEED_STEP per-step timeout of cfg, or the default if unset.
+func speedStepTimeout(cfg *pb.LinkTrain) time.Duration {
+	if ms := cfg.GetSpeedStep().GetTimeoutMs(); ms > 0 {
+		return time.Duration(ms) * time.Millisecond
+	}
+	return defaultSpeedStepTimeout
+}
+
 // OverrideUSPBDFs replaces the USP BDF filter of cfg with bdfs, e.g. from a
 // command line flag.
 //
@@ -831,6 +1046,7 @@ var getLinks = func(devs pci.Dev, cfg *pb.LinkTrain) ([]*Linktest, error) {
 		lt.linkUpTimeout = defaultLinkUpTimeout
 		lt.linkUpStableDelay = defaultLinkUpStableDelay
 		lt.linkDownTimeout = defaultLinkDownTimeout
+		lt.speedStepTimeout = speedStepTimeout(lt.Cfg)
 
 		linktests = append(linktests, &lt)
 	}
@@ -1172,6 +1388,8 @@ var trainLoop = func(lt *Linktest) {
 			trainErr = lt.secondaryBusReset()
 		case pb.LinkTrain_M_REENABLE:
 			trainErr = lt.reenable()
+		case pb.LinkTrain_M_SPEED_STEP:
+			trainErr = lt.speedStep()
 		}
 		iterationDuration := time.Now().Sub(timeBeforeIteration)
 		if trainErr != nil {
@@ -1349,6 +1567,9 @@ var ocpTestRunStart = func(cfg *pb.LinkTrain) {
 // It identifies links to be tested, tests them in parallel, and writes out the result.
 func LinkTrain(cfg *pb.LinkTrain) (pass bool, _ error) {
 	if err := validateLinkTarget(cfg.GetLinkTarget()); err != nil {
+		return false, err
+	}
+	if err := validateSpeedSteps(cfg); err != nil {
 		return false, err
 	}
 

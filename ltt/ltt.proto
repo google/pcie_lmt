@@ -97,9 +97,41 @@ message LinkTrain {
     M_SBR = 1;              // Secondary Bus Reset
     M_REENABLE = 2;         // Link disable and re-enable
     M_RETRAIN_WITH_EQ = 3;  // Link Retrain with Perform Equalization bit set
+    // Link Retrain through each Target Link Speed in speed_step.speeds. The
+    // link stays in DL_Active, so the endpoint is not reset.
+    M_SPEED_STEP = 4;
   }
 
   Method method = 10;
+
+  // Parameters for M_SPEED_STEP. Rejected when method is not M_SPEED_STEP.
+  message SpeedStepConfig {
+    // The Target Link Speeds to step the link through, in order, in every
+    // iteration. Required for M_SPEED_STEP.
+    //
+    // Each value is a Target Link Speed in the DSP's Link Control 2 Register
+    // (Spec 7.5.3.19), e.g. 1 = 2.5 GT/s, 2 = 5.0 GT/s, 3 = 8.0 GT/s,
+    // 4 = 16.0 GT/s, 5 = 32.0 GT/s, 6 = 64.0 GT/s, and must be at least 1. In
+    // every iteration, a step that is not in the Supported Link Speeds Vector
+    // of both ends of the link is skipped with a warning, and the iteration
+    // fails if no step is left. Each step must differ from the previous one,
+    // and the first must differ from the link's speed at the start of the
+    // iteration, so that every step is an observable speed change. For each
+    // step, the test writes the Target Link Speed, sets Retrain Link and waits
+    // for both ends to reach that speed with the Data Link Layer active.
+    //
+    // At the end of each iteration, the DSP's original Link Control 2 Register
+    // value is restored, and the link is retrained back to its starting speed
+    // if it is not already there. E.g. [1, 3, 4, 5] steps a Gen5 link down to
+    // Gen1 and back up through Gen3 and Gen4.
+    repeated int32 speeds = 1;
+
+    // Timeout in ms for each step to reach its speed. If unset or 0, 100 ms is
+    // used. Must not be negative.
+    int32 timeout_ms = 2;
+  }
+
+  optional SpeedStepConfig speed_step = 21;
 
   // Wait time per training iteration in ms, normally 100ms for all methods.
   uint32 training_wait_ms = 11;
