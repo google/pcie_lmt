@@ -2096,6 +2096,18 @@ func TestIsLinkDown(t *testing.T) {
 		{name: "speed mismatch is not link down", err: &TrainError{Code: ErrDspUspSpeedMismatch}, want: false},
 		{name: "disable timeout is not link down", err: &TrainError{Code: ErrDisableTimeout}, want: false},
 		{name: "non TrainError", err: errors.New("some other error"), want: false},
+		{name: "wrapped link down", err: fmt.Errorf("wrapped: %w", &TrainError{Code: ErrLinkDown}), want: true},
+		{
+			name: "link down joined after another TrainError",
+			err:  errors.Join(&TrainError{Code: ErrLinkUpTimeout}, fmt.Errorf("restore: %w", &TrainError{Code: ErrLinkDown})),
+			want: true,
+		},
+		{
+			name: "joined errors without link down",
+			err:  errors.Join(&TrainError{Code: ErrLinkUpTimeout}, errors.New("other")),
+			want: false,
+		},
+		{name: "joined typed nil TrainError", err: errors.Join((*TrainError)(nil), errors.New("other")), want: false},
 	}
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -2116,5 +2128,627 @@ func TestLinkDownSkipsFieldCheck(t *testing.T) {
 	}
 	if !needFieldCheck(&TrainError{Code: ErrLinkUpTimeout}) {
 		t.Error("needFieldCheck(ErrLinkUpTimeout) = false, want true; a downtrained link still needs the field check")
+	}
+	if err := errors.Join(&TrainError{Code: ErrLinkUpTimeout}, &TrainError{Code: ErrLinkDown}); needFieldCheck(err) {
+		t.Errorf("needFieldCheck(%v) = true, want false; a link down anywhere in the tree skips the field check", err)
+	}
+}
+
+// fakeSpeedStepLink models the Link Status of both ends of a link whose DSP Target Link Speed is
+// stepped by speedStep. Each Retrain Link write makes the DSP report `stale` reads of the old state,
+// then `training` reads with Link Training set, then L0 at the new speed.
+type fakeSpeedStepLink struct {
+	lnkctl     uint16
+	lnkctl2    uint16
+	dspLnkCap2 uint32
+	uspLnkCap2 uint32
+	dspLnkCap  uint32
+	uspLnkCap  uint32
+	stale      int
+	training   int
+	// refuse lists Target Link Speeds that the link fails to reach: a retrain leaves the speed as is.
+	refuse     map[uint16]bool
+	uspAllOnes bool
+	// dropOnRetrain takes the link down on the first retrain: the DSP reports DL_Down and the USP
+	// stops responding.
+	dropOnRetrain bool
+	down          bool
+
+	speed      uint16   // Current Link Speed once the queued reads are consumed.
+	queue      []uint16 // DSP Link Status values to return before reaching speed.
+	lastDspSta uint16
+
+	tlsWrites     []uint16 // Values written to the DSP's Link Control 2 Register.
+	retrains      int
+	otherWrites   []int32 // Addresses of any other writes.
+	uspMidRetrain int     // USP Link Status reads while the last DSP read showed Link Training.
+}
+
+const (
+	fakeDspCap      = int32(0x80)
+	fakeUspCap      = int32(0x40)
+	fakeLnkStaDLAct = uint16(0x2000)
+	fakeLnkStaTrain = uint16(0x0800)
+	fakeLnkCtlRetr  = uint16(0x0020)
+)
+
+func (f *fakeSpeedStepLink) install(t *testing.T) {
+	t.Helper()
+	origReadWord, origReadLong, origWriteWord := pciReadWord, pciReadLong, pciWriteWord
+	t.Cleanup(func() {
+		pciReadWord, pciReadLong, pciWriteWord = origReadWord, origReadLong, origWriteWord
+	})
+	pciReadLong = func(_ pci.Dev, addr int32) uint32 {
+		switch addr {
+		case fakeDspCap + 0x2c:
+			return f.dspLnkCap2
+		case fakeUspCap + 0x2c:
+			return f.uspLnkCap2
+		case fakeDspCap + 0x0c:
+			return f.dspLnkCap
+		case fakeUspCap + 0x0c:
+			return f.uspLnkCap
+		}
+		return 0
+	}
+	pciReadWord = func(_ pci.Dev, addr int32) uint16 {
+		switch addr {
+		case fakeDspCap + 0x10:
+			return f.lnkctl
+		case fakeDspCap + 0x30:
+			return f.lnkctl2
+		case fakeDspCap + 0x12:
+			if f.down {
+				f.lastDspSta = 0
+				return 0
+			}
+			f.lastDspSta = fakeLnkStaDLAct | f.speed
+			if len(f.queue) > 0 {
+				f.lastDspSta, f.queue = f.queue[0], f.queue[1:]
+			}
+			return f.lastDspSta
+		case fakeUspCap + 0x12:
+			if f.lastDspSta&fakeLnkStaTrain != 0 {
+				f.uspMidRetrain++
+			}
+			if f.uspAllOnes || f.down {
+				return 0xffff
+			}
+			return fakeLnkStaDLAct | f.speed
+		}
+		return 0
+	}
+	pciWriteWord = func(_ pci.Dev, addr int32, val uint16) {
+		switch addr {
+		case fakeDspCap + 0x30:
+			f.lnkctl2 = val
+			f.tlsWrites = append(f.tlsWrites, val)
+		case fakeDspCap + 0x10:
+			if val&fakeLnkCtlRetr == 0 {
+				f.otherWrites = append(f.otherWrites, addr)
+				return
+			}
+			f.retrains++
+			if f.dropOnRetrain {
+				f.down = true
+			}
+			old := fakeLnkStaDLAct | f.speed
+			for i := 0; i < f.stale; i++ {
+				f.queue = append(f.queue, old)
+			}
+			for i := 0; i < f.training; i++ {
+				f.queue = append(f.queue, old|fakeLnkStaTrain)
+			}
+			if tls := f.lnkctl2 & 0xf; !f.refuse[tls] {
+				f.speed = tls
+			}
+		default:
+			f.otherWrites = append(f.otherWrites, addr)
+		}
+	}
+}
+
+func newSpeedStepLinktest(steps ...int32) *Linktest {
+	return &Linktest{
+		uspPCIeCapOffset:       fakeUspCap,
+		dspPCIeCapOffset:       fakeDspCap,
+		linkStatusPollInterval: 1 * time.Millisecond,
+		linkUpTimeout:          100 * time.Millisecond,
+		// Large, so that an accidental pollLinkUp settle sleep is caught by the elapsed time checks.
+		linkUpStableDelay: 250 * time.Millisecond,
+		linkDownTimeout:   100 * time.Millisecond,
+		speedStepTimeout:  20 * time.Millisecond,
+		Cfg: &pb.LinkTrain{
+			UspBdf:    proto.String("0000:02:00.0"),
+			DspBdf:    proto.String("0000:01:01.0"),
+			Method:    pb.LinkTrain_M_SPEED_STEP,
+			SpeedStep: &pb.LinkTrain_SpeedStepConfig{Speeds: steps},
+		},
+	}
+}
+
+// newGen5FakeLink returns a fake Gen5 link whose DSP Link Control 2 Register has Target Link Speed
+// 5 and an unrelated bit (Hardware Autonomous Speed Disable, 0x20) that must be preserved.
+func newGen5FakeLink(t *testing.T) *fakeSpeedStepLink {
+	f := &fakeSpeedStepLink{
+		lnkctl:     0x0040, // Common Clock Configuration, must be preserved.
+		lnkctl2:    0x0025,
+		dspLnkCap2: 0x3e, // 2.5 to 32.0 GT/s.
+		uspLnkCap2: 0x3e,
+		speed:      5,
+	}
+	f.install(t)
+	return f
+}
+
+func TestSpeedStep(t *testing.T) {
+	t.Run("steps through every speed, preserves other bits and restores Link Control 2", func(t *testing.T) {
+		f := newGen5FakeLink(t)
+		f.stale = 1
+		f.training = 2
+		lt := newSpeedStepLinktest(1, 3, 4, 5)
+		start := time.Now()
+		if err := lt.speedStep(); err != nil {
+			t.Fatalf("speedStep() unexpected error: %v", err)
+		}
+		if elapsed := time.Since(start); elapsed >= lt.linkUpStableDelay {
+			t.Errorf("speedStep() took %v, want < %v (no settle sleep with DL up)", elapsed, lt.linkUpStableDelay)
+		}
+		wantTLS := []uint16{0x0021, 0x0023, 0x0024, 0x0025, 0x0025}
+		if !slices.Equal(f.tlsWrites, wantTLS) {
+			t.Errorf("speedStep() Link Control 2 writes = %#04x, want %#04x", f.tlsWrites, wantTLS)
+		}
+		if f.retrains != 4 {
+			t.Errorf("speedStep() issued %d retrains, want 4 (one per step, none to restore)", f.retrains)
+		}
+		if len(f.otherWrites) != 0 {
+			t.Errorf("speedStep() wrote other registers at %#x, want only DSP Link Control and Link Control 2", f.otherWrites)
+		}
+		if f.uspMidRetrain != 0 {
+			t.Errorf("speedStep() read USP Link Status %d times while the DSP was in training, want 0", f.uspMidRetrain)
+		}
+		if f.speed != 5 {
+			t.Errorf("speedStep() left the link at speed %d, want 5", f.speed)
+		}
+	})
+
+	t.Run("passes when the retrain completes before the first read", func(t *testing.T) {
+		f := newGen5FakeLink(t)
+		lt := newSpeedStepLinktest(1, 3, 4, 5)
+		if err := lt.speedStep(); err != nil {
+			t.Fatalf("speedStep() unexpected error: %v", err)
+		}
+		if f.retrains != 4 {
+			t.Errorf("speedStep() issued %d retrains, want 4", f.retrains)
+		}
+	})
+
+	t.Run("times out on a speed the link does not reach, then restores the starting speed", func(t *testing.T) {
+		f := newGen5FakeLink(t)
+		f.training = 1
+		f.refuse = map[uint16]bool{3: true}
+		lt := newSpeedStepLinktest(1, 3, 4, 5)
+		err := lt.speedStep()
+		var te *TrainError
+		if !errors.As(err, &te) || te.Code != ErrLinkUpTimeout {
+			t.Fatalf("speedStep() error = %v, want ErrLinkUpTimeout", err)
+		}
+		if !strings.Contains(te.Message, "DSP speed 0x1, want 0x3") {
+			t.Errorf("speedStep() error message = %q, want it to name the speed mismatch", te.Message)
+		}
+		if f.lnkctl2 != 0x0025 {
+			t.Errorf("speedStep() left Link Control 2 = %#04x, want the original 0x0025", f.lnkctl2)
+		}
+		// Retrains: to Gen1, to Gen3 (refused), and one more to restore Gen5.
+		if f.retrains != 3 {
+			t.Errorf("speedStep() issued %d retrains, want 3", f.retrains)
+		}
+		if f.speed != 5 {
+			t.Errorf("speedStep() left the link at speed %d, want 5", f.speed)
+		}
+	})
+
+	t.Run("reports ErrLinkDown when the USP stops responding", func(t *testing.T) {
+		f := newGen5FakeLink(t)
+		f.uspAllOnes = true
+		lt := newSpeedStepLinktest(1, 5)
+		err := lt.speedStep()
+		if !isLinkDown(err) {
+			t.Errorf("speedStep() error = %v, want ErrLinkDown", err)
+		}
+		if f.lnkctl2 != 0x0025 {
+			t.Errorf("speedStep() left Link Control 2 = %#04x, want the original 0x0025", f.lnkctl2)
+		}
+		if f.retrains != 1 {
+			t.Errorf("speedStep() issued %d retrains, want 1 (no restore retrain on a down link)", f.retrains)
+		}
+	})
+
+	t.Run("reports ErrLinkDown when the link drops, without waiting to restore it", func(t *testing.T) {
+		f := newGen5FakeLink(t)
+		f.dropOnRetrain = true
+		lt := newSpeedStepLinktest(1, 3, 4, 5)
+		start := time.Now()
+		err := lt.speedStep()
+		elapsed := time.Since(start)
+		var te *TrainError
+		if !errors.As(err, &te) || te.Code != ErrLinkDown {
+			t.Fatalf("speedStep() error = %v, want ErrLinkDown", err)
+		}
+		if !strings.Contains(te.Message, "data link not active") {
+			t.Errorf("speedStep() error message = %q, want it to say the data link is not active", te.Message)
+		}
+		if f.lnkctl2 != 0x0025 {
+			t.Errorf("speedStep() left Link Control 2 = %#04x, want the original 0x0025", f.lnkctl2)
+		}
+		if f.retrains != 1 {
+			t.Errorf("speedStep() issued %d retrains, want 1 (no restore retrain on a down link)", f.retrains)
+		}
+		if elapsed >= lt.linkUpTimeout {
+			t.Errorf("speedStep() took %v, want < linkUpTimeout (%v): it must not poll a down link to restore it", elapsed, lt.linkUpTimeout)
+		}
+	})
+
+	t.Run("reports ErrLinkDown found while restoring the speed", func(t *testing.T) {
+		f := newGen5FakeLink(t)
+		f.refuse = map[uint16]bool{3: true}
+		lt := newSpeedStepLinktest(1, 3, 4, 5)
+		// The USP stops responding once the Gen3 step has timed out.
+		origReadWord := pciReadWord
+		pciReadWord = func(dev pci.Dev, addr int32) uint16 {
+			if addr == fakeUspCap+0x12 && f.retrains == 2 && f.lnkctl2 == 0x0025 {
+				return 0xffff
+			}
+			return origReadWord(dev, addr)
+		}
+		err := lt.speedStep()
+		if !isLinkDown(err) {
+			t.Errorf("speedStep() error = %v, want ErrLinkDown in the tree", err)
+		}
+		if needFieldCheck(err) {
+			t.Errorf("needFieldCheck(%v) = true, want false", err)
+		}
+		if f.retrains != 2 {
+			t.Errorf("speedStep() issued %d retrains, want 2 (no restore retrain on a down link)", f.retrains)
+		}
+	})
+
+	t.Run("reports a restore failure", func(t *testing.T) {
+		f := newGen5FakeLink(t)
+		f.refuse = map[uint16]bool{5: true}
+		lt := newSpeedStepLinktest(1, 3, 4, 5)
+		lt.linkUpTimeout = 15 * time.Millisecond
+		err := lt.speedStep()
+		if err == nil || !strings.Contains(err.Error(), "failed to restore the link speed") {
+			t.Errorf("speedStep() error = %v, want a restore failure", err)
+		}
+		if err == nil || !strings.Contains(err.Error(), "DSP speed 0x4, want >= 0x5") {
+			t.Errorf("speedStep() error = %v, want restore timeout message to format >= startSpeed", err)
+		}
+		var te *TrainError
+		if !errors.As(err, &te) || te.Code != ErrLinkUpTimeout {
+			t.Errorf("speedStep() error = %v, want ErrLinkUpTimeout first", err)
+		}
+	})
+
+	t.Run("restores to a speed above startSpeed when the link began downtrained", func(t *testing.T) {
+		f := newGen5FakeLink(t)
+		f.speed = 4 // Downtrained at Gen4 while Link Control 2 still targets Gen5 (0x0025).
+		f.refuse = map[uint16]bool{3: true}
+		lt := newSpeedStepLinktest(1, 3, 5)
+		err := lt.speedStep()
+		if err != nil && strings.Contains(err.Error(), "failed to restore the link speed") {
+			t.Errorf("speedStep() error = %v, want restore to accept Gen5 >= startSpeed Gen4", err)
+		}
+		if f.speed != 5 {
+			t.Errorf("speedStep() left the link at speed %d, want 5", f.speed)
+		}
+	})
+
+	t.Run("reports a restore failure without retraining when the DSP is stuck in training during restore", func(t *testing.T) {
+		f := newGen5FakeLink(t)
+		f.refuse = map[uint16]bool{1: true}
+		lt := newSpeedStepLinktest(1, 5)
+		lt.linkUpTimeout = 15 * time.Millisecond
+		// Once Link Control 2 is restored to 0x0025 after the failed step, the DSP stays stuck
+		// with Link Training set while reporting Current Link Speed 5 (== startSpeed).
+		origReadWord := pciReadWord
+		pciReadWord = func(dev pci.Dev, addr int32) uint16 {
+			if addr == fakeDspCap+0x12 && f.retrains == 1 && f.lnkctl2 == 0x0025 {
+				return fakeLnkStaDLAct | fakeLnkStaTrain | 5
+			}
+			return origReadWord(dev, addr)
+		}
+		err := lt.speedStep()
+		if err == nil || !strings.Contains(err.Error(), "failed to restore the link speed") {
+			t.Fatalf("speedStep() error = %v, want a restore failure when DSP stays in training", err)
+		}
+		if !strings.Contains(err.Error(), "stuck in training before retrain") {
+			t.Errorf("speedStep() error = %v, want pollNotTraining timeout reason", err)
+		}
+		if f.retrains != 1 {
+			t.Errorf("speedStep() issued %d retrains, want 1 (must not retrain while Link Training is 1b)", f.retrains)
+		}
+	})
+
+	t.Run("returns ErrLinkUpTimeout before writing when the DSP starts stuck in training", func(t *testing.T) {
+		f := newGen5FakeLink(t)
+		origReadWord := pciReadWord
+		pciReadWord = func(dev pci.Dev, addr int32) uint16 {
+			if addr == fakeDspCap+0x12 {
+				return fakeLnkStaDLAct | fakeLnkStaTrain | 5
+			}
+			return origReadWord(dev, addr)
+		}
+		lt := newSpeedStepLinktest(1, 5)
+		lt.linkUpTimeout = 15 * time.Millisecond
+		err := lt.speedStep()
+		var te *TrainError
+		if !errors.As(err, &te) || te.Code != ErrLinkUpTimeout {
+			t.Fatalf("speedStep() error = %v, want ErrLinkUpTimeout", err)
+		}
+		if !strings.Contains(te.Message, "stuck in training before retrain") {
+			t.Errorf("speedStep() error message = %q, want pollNotTraining timeout reason", te.Message)
+		}
+		if len(f.tlsWrites) != 0 || f.retrains != 0 || len(f.otherWrites) != 0 {
+			t.Errorf("speedStep() wrote config space (TLS %#04x, %d retrains, other %#x), want no writes",
+				f.tlsWrites, f.retrains, f.otherWrites)
+		}
+	})
+
+	t.Run("returns ErrLinkUpTimeout when the DSP re-enters training before a later step", func(t *testing.T) {
+		f := newGen5FakeLink(t)
+		origReadWord := pciReadWord
+		step1Settled := false
+		pciReadWord = func(dev pci.Dev, addr int32) uint16 {
+			if addr == fakeUspCap+0x12 && f.retrains == 1 {
+				step1Settled = true
+			}
+			if addr == fakeDspCap+0x12 && step1Settled && f.lnkctl2 == 0x0021 {
+				return fakeLnkStaDLAct | fakeLnkStaTrain | 1
+			}
+			return origReadWord(dev, addr)
+		}
+		lt := newSpeedStepLinktest(1, 3, 5)
+		lt.linkUpTimeout = 15 * time.Millisecond
+		err := lt.speedStep()
+		var te *TrainError
+		if !errors.As(err, &te) || te.Code != ErrLinkUpTimeout {
+			t.Fatalf("speedStep() error = %v, want ErrLinkUpTimeout", err)
+		}
+		if !strings.Contains(te.Message, "stuck in training before retrain") {
+			t.Errorf("speedStep() error message = %q, want pollNotTraining timeout reason", te.Message)
+		}
+		// Retrains: step 1 to Gen1, then restore back to Gen5 (step 2 never wrote Retrain Link).
+		if f.retrains != 2 {
+			t.Errorf("speedStep() issued %d retrains, want 2", f.retrains)
+		}
+		if f.speed != 5 {
+			t.Errorf("speedStep() left the link at speed %d, want 5", f.speed)
+		}
+	})
+
+	t.Run("times out when the DSP reaches the target speed but the USP reports another speed", func(t *testing.T) {
+		f := newGen5FakeLink(t)
+		origReadWord := pciReadWord
+		pciReadWord = func(dev pci.Dev, addr int32) uint16 {
+			if addr == fakeUspCap+0x12 && f.lnkctl2 == 0x0021 {
+				return fakeLnkStaDLAct | 5
+			}
+			return origReadWord(dev, addr)
+		}
+		lt := newSpeedStepLinktest(1, 5)
+		err := lt.speedStep()
+		var te *TrainError
+		if !errors.As(err, &te) || te.Code != ErrLinkUpTimeout {
+			t.Fatalf("speedStep() error = %v, want ErrLinkUpTimeout", err)
+		}
+		if !strings.Contains(te.Message, "USP speed 0x5, want 0x1") {
+			t.Errorf("speedStep() error message = %q, want USP speed mismatch", te.Message)
+		}
+	})
+
+	testCases := []struct {
+		name       string
+		steps      []int32
+		dspLnkCap2 uint32
+		dspLnkCap  uint32
+		wantErrSub string
+	}{
+		{
+			name:       "speed not in the DSP's Supported Link Speeds Vector",
+			steps:      []int32{1, 3, 4, 5},
+			dspLnkCap2: 0x1e, // Up to 16.0 GT/s.
+			wantErrSub: "speed 0x5 is not supported",
+		},
+		{
+			name:       "speed above the Max Link Speed without a Supported Link Speeds Vector",
+			steps:      []int32{1, 3, 4, 5},
+			dspLnkCap:  0x4, // Max Link Speed 16.0 GT/s.
+			wantErrSub: "speed 0x5 is not supported",
+		},
+		{
+			name:       "first step at the current speed",
+			steps:      []int32{5, 4},
+			dspLnkCap2: 0x3e,
+			wantErrSub: "does not change the link speed 0x5",
+		},
+	}
+	for _, tc := range testCases {
+		t.Run("rejects before writing: "+tc.name, func(t *testing.T) {
+			f := newGen5FakeLink(t)
+			f.dspLnkCap2 = tc.dspLnkCap2
+			f.dspLnkCap = tc.dspLnkCap
+			err := newSpeedStepLinktest(tc.steps...).speedStep()
+			var te *TrainError
+			if !errors.As(err, &te) || te.Code != ErrInvalidSpeedStep {
+				t.Fatalf("speedStep() error = %v, want ErrInvalidSpeedStep", err)
+			}
+			if !strings.Contains(te.Message, tc.wantErrSub) {
+				t.Errorf("speedStep() error message = %q, want substring %q", te.Message, tc.wantErrSub)
+			}
+			if len(f.tlsWrites) != 0 || f.retrains != 0 || len(f.otherWrites) != 0 {
+				t.Errorf("speedStep() wrote config space (TLS %#04x, %d retrains, other %#x), want no writes",
+					f.tlsWrites, f.retrains, f.otherWrites)
+			}
+		})
+	}
+}
+
+func TestSupportedLinkSpeeds(t *testing.T) {
+	testCases := []struct {
+		name    string
+		lnkCap2 uint32
+		lnkCap  uint32
+		want    uint32
+	}{
+		{name: "vector up to 32.0 GT/s ignores reserved bit 0 and other fields", lnkCap2: 0x8000013f, want: 0x3e},
+		{name: "vector up to 64.0 GT/s", lnkCap2: 0x7e, want: 0x7e},
+		{name: "no vector falls back to Max Link Speed 8.0 GT/s", lnkCap: 0x00400083, want: 0x0e},
+		{name: "no vector and Max Link Speed above 64.0 GT/s is capped", lnkCap: 0xf, want: 0x7e},
+		{name: "nothing supported", want: 0},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := &fakeSpeedStepLink{dspLnkCap2: tc.lnkCap2, dspLnkCap: tc.lnkCap}
+			f.install(t)
+			if got := supportedLinkSpeeds(pci.Dev{}, fakeDspCap); got != tc.want {
+				t.Errorf("supportedLinkSpeeds() = %#02x, want %#02x", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestValidateSpeedSteps(t *testing.T) {
+	testCases := []struct {
+		name       string
+		cfg        *pb.LinkTrain
+		wantErrSub string // Empty means no error.
+	}{
+		{
+			name: "speed step with steps",
+			cfg: &pb.LinkTrain{
+				Method:    pb.LinkTrain_M_SPEED_STEP,
+				SpeedStep: &pb.LinkTrain_SpeedStepConfig{Speeds: []int32{1, 3, 4, 5}, TimeoutMs: 50},
+			},
+		},
+		{
+			name: "other method without speed_step",
+			cfg:  &pb.LinkTrain{Method: pb.LinkTrain_M_REENABLE},
+		},
+		{
+			name:       "speed step without speed_step",
+			cfg:        &pb.LinkTrain{Method: pb.LinkTrain_M_SPEED_STEP},
+			wantErrSub: "requires speed_step.speeds",
+		},
+		{
+			name:       "speed step with empty speeds",
+			cfg:        &pb.LinkTrain{Method: pb.LinkTrain_M_SPEED_STEP, SpeedStep: &pb.LinkTrain_SpeedStepConfig{}},
+			wantErrSub: "requires speed_step.speeds",
+		},
+		{
+			name: "negative timeout_ms",
+			cfg: &pb.LinkTrain{
+				Method:    pb.LinkTrain_M_SPEED_STEP,
+				SpeedStep: &pb.LinkTrain_SpeedStepConfig{Speeds: []int32{1, 5}, TimeoutMs: -1},
+			},
+			wantErrSub: "speed_step.timeout_ms = -1 must not be negative",
+		},
+		{
+			name: "step 0",
+			cfg: &pb.LinkTrain{
+				Method:    pb.LinkTrain_M_SPEED_STEP,
+				SpeedStep: &pb.LinkTrain_SpeedStepConfig{Speeds: []int32{1, 0}},
+			},
+			wantErrSub: "speed_step.speeds[1] = 0 is not a Target Link Speed",
+		},
+		{
+			name: "negative step",
+			cfg: &pb.LinkTrain{
+				Method:    pb.LinkTrain_M_SPEED_STEP,
+				SpeedStep: &pb.LinkTrain_SpeedStepConfig{Speeds: []int32{-1}},
+			},
+			wantErrSub: "speed_step.speeds[0] = -1 is not a Target Link Speed",
+		},
+		{
+			name: "step above 64.0 GT/s",
+			cfg: &pb.LinkTrain{
+				Method:    pb.LinkTrain_M_SPEED_STEP,
+				SpeedStep: &pb.LinkTrain_SpeedStepConfig{Speeds: []int32{7}},
+			},
+			wantErrSub: "speed_step.speeds[0] = 7 is not a Target Link Speed",
+		},
+		{
+			name: "repeated step",
+			cfg: &pb.LinkTrain{
+				Method:    pb.LinkTrain_M_SPEED_STEP,
+				SpeedStep: &pb.LinkTrain_SpeedStepConfig{Speeds: []int32{1, 3, 3, 5}},
+			},
+			wantErrSub: "speed_step.speeds[2] = 3 repeats the previous step",
+		},
+		{
+			name: "speed_step with another method",
+			cfg: &pb.LinkTrain{
+				Method:    pb.LinkTrain_M_RETRAIN_WITH_EQ,
+				SpeedStep: &pb.LinkTrain_SpeedStepConfig{Speeds: []int32{1, 5}},
+			},
+			wantErrSub: "speed_step is only used by M_SPEED_STEP, not M_RETRAIN_WITH_EQ",
+		},
+		{
+			name: "empty speed_step message with another method",
+			cfg: &pb.LinkTrain{
+				Method:    pb.LinkTrain_M_RETRAIN_DEFAULT,
+				SpeedStep: &pb.LinkTrain_SpeedStepConfig{},
+			},
+			wantErrSub: "speed_step is only used by M_SPEED_STEP",
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateSpeedSteps(tc.cfg)
+			if tc.wantErrSub == "" {
+				if err != nil {
+					t.Errorf("validateSpeedSteps(%v) = %v, want nil", tc.cfg, err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErrSub) {
+				t.Errorf("validateSpeedSteps(%v) = %v, want an error containing %q", tc.cfg, err, tc.wantErrSub)
+			}
+		})
+	}
+}
+
+func TestLinkTrainRejectsInvalidSpeedSteps(t *testing.T) {
+	oldPciScanDevices := pciScanDevices
+	defer func() { pciScanDevices = oldPciScanDevices }()
+	pciScanDevices = func() pci.Dev {
+		t.Error("LinkTrain() scanned the PCI devices despite invalid speed_step")
+		return pci.Dev{}
+	}
+	cfg := &pb.LinkTrain{
+		LinkTarget: &pb.PcieLinkTarget{AllLinks: proto.Bool(true)},
+		Method:     pb.LinkTrain_M_SPEED_STEP,
+	}
+	if _, err := LinkTrain(cfg); err == nil || !strings.Contains(err.Error(), "speed_step") {
+		t.Errorf("LinkTrain(%v) = %v, want a speed_step error", cfg, err)
+	}
+}
+
+func TestSpeedStepTimeout(t *testing.T) {
+	if got := speedStepTimeout(&pb.LinkTrain{}); got != defaultSpeedStepTimeout {
+		t.Errorf("speedStepTimeout(unset) = %v, want %v", got, defaultSpeedStepTimeout)
+	}
+	cfg := &pb.LinkTrain{SpeedStep: &pb.LinkTrain_SpeedStepConfig{TimeoutMs: 250}}
+	if got, want := speedStepTimeout(cfg), 250*time.Millisecond; got != want {
+		t.Errorf("speedStepTimeout(250) = %v, want %v", got, want)
+	}
+}
+
+// TestInvalidSpeedStepSkipsFieldCheck pins that an untrainable speed step, which is rejected before
+// the link is touched, is not scored by comparing the fields against the spec.
+func TestInvalidSpeedStepSkipsFieldCheck(t *testing.T) {
+	if needFieldCheck(&TrainError{Code: ErrInvalidSpeedStep}) {
+		t.Error("needFieldCheck(ErrInvalidSpeedStep) = true, want false")
 	}
 }

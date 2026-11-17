@@ -63,7 +63,7 @@ link_target {
 #   link_target { all_links: true }
 
 iterations: 100
-method: M_REENABLE  # Other options are M_SBR or M_RETRAIN_DEFAULT
+method: M_REENABLE  # Other options are M_SBR, M_RETRAIN_DEFAULT, M_RETRAIN_WITH_EQ or M_SPEED_STEP
 training_wait_ms: 1000
 
 continue: true
