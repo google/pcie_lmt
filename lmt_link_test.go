@@ -256,3 +256,142 @@ func TestOutputLaneError(t *testing.T) {
 		})
 	}
 }
+
+func TestDiagnoseLanes(t *testing.T) {
+	spec := &lmtpb.LinkMargin_TestSpec{}
+	const hwinfo = "BDF=0000:01:00.0;RX=USP_F6"
+	diag := func(typ ocppb.Diagnosis_Type, verdict, msg string) *ocppb.Diagnosis {
+		return &ocppb.Diagnosis{
+			Type:           typ,
+			Verdict:        verdict,
+			Message:        msg,
+			HardwareInfoId: hwinfo,
+		}
+	}
+	testCases := []struct {
+		name      string
+		lanes     []*Lane
+		linkcheck bool
+		gen       uint32
+		width     uint32
+		wantLanes int
+		wantDiag  *ocppb.Diagnosis
+	}{
+		{
+			name: "all tested lanes failed early",
+			lanes: []*Lane{
+				{laneNumber: 0, Tspec: spec, Pass: false, lane: nil},
+				{laneNumber: 1, Tspec: spec, Pass: false, lane: nil},
+			},
+			linkcheck: true,
+			gen:       5,
+			width:     16,
+			wantLanes: 0,
+			wantDiag:  nil,
+		},
+		{
+			name: "one lane failed early and one lane passed",
+			lanes: []*Lane{
+				{laneNumber: 0, Tspec: spec, Pass: false, lane: nil},
+				{laneNumber: 1, Tspec: spec, Pass: true, lane: &lmtpb.LinkMargin_Lane{}},
+			},
+			linkcheck: true,
+			gen:       5,
+			width:     16,
+			wantLanes: 1,
+			wantDiag:  diag(ocppb.Diagnosis_PASS, "pcie_lmt-rx_ln-pass", "1 Rx-lane tested. All passed."),
+		},
+		{
+			name: "one lane failed early and one lane failed margin",
+			lanes: []*Lane{
+				{laneNumber: 0, Tspec: spec, Pass: false, lane: nil},
+				{laneNumber: 1, Tspec: spec, Pass: false, lane: &lmtpb.LinkMargin_Lane{}},
+			},
+			linkcheck: true,
+			gen:       5,
+			width:     16,
+			wantLanes: 1,
+			wantDiag:  diag(ocppb.Diagnosis_FAIL, "pcie_lmt-rx_ln-fail", "1 Rx-lane tested; 1 failed."),
+		},
+		{
+			// A lane that aborts before any margin point (e.g. in readLaneParameters) keeps
+			// the Pass=true default from Init, and must not be counted as a tested lane.
+			name: "lane aborted before margining keeps Init default Pass",
+			lanes: []*Lane{
+				{laneNumber: 0, Tspec: spec, Pass: true, lane: nil},
+				{laneNumber: 1, Tspec: spec, Pass: false, lane: &lmtpb.LinkMargin_Lane{}},
+			},
+			linkcheck: true,
+			gen:       5,
+			width:     16,
+			wantLanes: 1,
+			wantDiag:  diag(ocppb.Diagnosis_FAIL, "pcie_lmt-rx_ln-fail", "1 Rx-lane tested; 1 failed."),
+		},
+		{
+			name: "no lanes specified",
+			lanes: []*Lane{
+				{laneNumber: 0, Pass: true},
+				{laneNumber: 1, Pass: true},
+			},
+			linkcheck: true,
+			gen:       5,
+			width:     16,
+			wantLanes: 0,
+			wantDiag:  diag(ocppb.Diagnosis_UNKNOWN, "pcie_lmt-rx_ln-unknown", "0 Rx-lane tested."),
+		},
+		{
+			name: "link width or speed changed",
+			lanes: []*Lane{
+				{laneNumber: 0, Tspec: spec, Pass: false, lane: nil},
+			},
+			linkcheck: false,
+			gen:       4,
+			width:     8,
+			wantLanes: 0,
+			wantDiag:  diag(ocppb.Diagnosis_FAIL, "pcie_lmt-rx_ln-fail", "Link width/speed changed from gen5x16 to gen4x8."),
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			ocp := captureOCP(t)
+			r := &receiver{
+				hwinfo: hwinfo,
+				port:   &port{gen: 5, width: 16},
+				lanes:  tc.lanes,
+			}
+
+			gotLanes := r.diagnoseLanes(tc.linkcheck, tc.gen, tc.width)
+
+			if len(gotLanes) != tc.wantLanes {
+				t.Errorf("diagnoseLanes() gathered %d lanes, want %d", len(gotLanes), tc.wantLanes)
+			}
+			trimmed := strings.TrimSpace(ocp())
+			if tc.wantDiag == nil {
+				if trimmed != "" {
+					t.Fatalf("diagnoseLanes() wrote %q, want no artifact", trimmed)
+				}
+				return
+			}
+			if trimmed == "" {
+				t.Fatalf("diagnoseLanes() wrote no artifact, want %v", tc.wantDiag)
+			}
+			got := &ocppb.OutputArtifact{}
+			if err := protojson.Unmarshal([]byte(trimmed), got); err != nil {
+				t.Fatalf("protojson.Unmarshal(%q) failed: %v", trimmed, err)
+			}
+			got.SequenceNumber = 0
+			got.Timestamp = nil
+			want := &ocppb.OutputArtifact{
+				Artifact: &ocppb.OutputArtifact_TestStepArtifact{
+					TestStepArtifact: &ocppb.TestStepArtifact{
+						Artifact:   &ocppb.TestStepArtifact_Diagnosis{Diagnosis: tc.wantDiag},
+						TestStepId: hwinfo,
+					},
+				},
+			}
+			if !proto.Equal(got, want) {
+				t.Errorf("diagnoseLanes() wrote %v, want %v", got, want)
+			}
+		})
+	}
+}
