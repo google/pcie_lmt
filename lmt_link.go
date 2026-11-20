@@ -126,21 +126,6 @@ func (lt *linktest) marginLink() {
 
 		r.marginLanes()
 
-		// Gather result protobuf
-		lncnt := 0
-		failcnt := 0
-		for _, ln := range r.lanes {
-			if ln.Vspec != nil || ln.Tspec != nil {
-				if lanepb := ln.GatherResult(); lanepb != nil {
-					lanes = append(lanes, lanepb)
-				}
-			}
-			lncnt++
-			if !ln.Pass {
-				failcnt++
-			}
-		}
-
 		// Checks if the link is still at the same width and speed.
 		addr := r.port.pcieCapOffset + C.PCI_EXP_LNKSTA
 		val := pci.ReadWord(r.port.dev, addr)
@@ -197,36 +182,7 @@ func (lt *linktest) marginLink() {
 		}
 		outputArtifact(outArti)
 
-		diag := &ocppb.Diagnosis{
-			Type:           ocppb.Diagnosis_UNKNOWN,
-			HardwareInfoId: r.hwinfo,
-		}
-		if !linkcheck {
-			diag.Type = ocppb.Diagnosis_FAIL
-			diag.Verdict = "pcie_lmt-rx_ln-fail"
-			diag.Message = fmt.Sprintf("Link width/speed changed from gen%dx%d to gen%dx%d.",
-				r.port.gen, r.port.width, gen, width)
-		} else if lncnt == 0 {
-			diag.Verdict = "pcie_lmt-rx_ln-unknown"
-			diag.Message = "0 Rx-lane tested."
-		} else if failcnt == 0 {
-			diag.Type = ocppb.Diagnosis_PASS
-			diag.Verdict = "pcie_lmt-rx_ln-pass"
-			diag.Message = fmt.Sprintf("%d Rx-lane tested. All passed.", lncnt)
-		} else {
-			diag.Type = ocppb.Diagnosis_FAIL
-			diag.Verdict = "pcie_lmt-rx_ln-fail"
-			diag.Message = fmt.Sprintf("%d Rx-lane tested; %d failed.", lncnt, failcnt)
-		}
-
-		stepArti = &ocppb.TestStepArtifact{
-			Artifact:   &ocppb.TestStepArtifact_Diagnosis{diag},
-			TestStepId: r.hwinfo,
-		}
-		outArti = &ocppb.OutputArtifact{
-			Artifact: &ocppb.OutputArtifact_TestStepArtifact{stepArti},
-		}
-		outputArtifact(outArti)
+		lanes = append(lanes, r.diagnoseLanes(linkcheck, gen, width)...)
 
 		// OCP TestStepEnd
 		stepEnd := &ocppb.TestStepEnd{
@@ -295,6 +251,69 @@ func createReceiver(lt *linktest, rxEnum lmtpb.LinkMargin_ReceiverEnum, dspLnkSt
 	// Registers the margin hooks.
 	rxpt.marginHooks = buildMarginHooks(rxpt)
 	return rxpt
+}
+
+// diagnoseLanes gathers the results of the lanes that completed margining and outputs the
+// receiver's OCP Diagnosis artifact. Lanes that failed early with an execution error already
+// streamed an OCP error artifact, so they are left out of the tested and failed counts, and no
+// Diagnosis is output when every tested lane failed early. A link width/speed change (linkcheck
+// false) always outputs a FAIL Diagnosis.
+func (r *receiver) diagnoseLanes(linkcheck bool, gen, width uint32) []*lmtpb.LinkMargin_Lane {
+	var lanes []*lmtpb.LinkMargin_Lane
+	lncnt, failcnt, errcnt := 0, 0, 0
+	for _, ln := range r.lanes {
+		if ln.Vspec == nil && ln.Tspec == nil {
+			continue
+		}
+		lanepb := ln.GatherResult()
+		if lanepb == nil {
+			errcnt++
+			continue
+		}
+		lanes = append(lanes, lanepb)
+		lncnt++
+		if !ln.Pass {
+			failcnt++
+		}
+	}
+
+	if linkcheck && lncnt == 0 && errcnt > 0 {
+		log.Warningf("%s: Skipping diagnosis because all %d tested lane(s) failed early with execution errors.",
+			r.rxRepr(), errcnt)
+		return lanes
+	}
+
+	diag := &ocppb.Diagnosis{
+		Type:           ocppb.Diagnosis_UNKNOWN,
+		HardwareInfoId: r.hwinfo,
+	}
+	if !linkcheck {
+		diag.Type = ocppb.Diagnosis_FAIL
+		diag.Verdict = "pcie_lmt-rx_ln-fail"
+		diag.Message = fmt.Sprintf("Link width/speed changed from gen%dx%d to gen%dx%d.",
+			r.port.gen, r.port.width, gen, width)
+	} else if lncnt == 0 {
+		diag.Verdict = "pcie_lmt-rx_ln-unknown"
+		diag.Message = "0 Rx-lane tested."
+	} else if failcnt == 0 {
+		diag.Type = ocppb.Diagnosis_PASS
+		diag.Verdict = "pcie_lmt-rx_ln-pass"
+		diag.Message = fmt.Sprintf("%d Rx-lane tested. All passed.", lncnt)
+	} else {
+		diag.Type = ocppb.Diagnosis_FAIL
+		diag.Verdict = "pcie_lmt-rx_ln-fail"
+		diag.Message = fmt.Sprintf("%d Rx-lane tested; %d failed.", lncnt, failcnt)
+	}
+
+	stepArti := &ocppb.TestStepArtifact{
+		Artifact:   &ocppb.TestStepArtifact_Diagnosis{diag},
+		TestStepId: r.hwinfo,
+	}
+	outArti := &ocppb.OutputArtifact{
+		Artifact: &ocppb.OutputArtifact_TestStepArtifact{stepArti},
+	}
+	outputArtifact(outArti)
+	return lanes
 }
 
 // outputLaneError streams an OCP error artifact for a lane that failed early.
