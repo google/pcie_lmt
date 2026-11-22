@@ -40,6 +40,13 @@ const (
 	ErrCapChainUnaligned
 	// ErrCapChainLoop indicates the capability linked list loops back on itself.
 	ErrCapChainLoop
+	// ErrInvalidSpeedStep indicates M_SPEED_STEP steps that cannot be trained: no step is in the
+	// Supported Link Speeds Vector of both ends of the link, or a step does not change the link
+	// speed, so its retrain would not be observable.
+	ErrInvalidSpeedStep
+	// ErrNoSupportedLinkSpeeds indicates a port whose Link Capabilities 2 Register has no Supported
+	// Link Speeds Vector, so M_SPEED_STEP cannot tell which speeds it supports.
+	ErrNoSupportedLinkSpeeds
 )
 
 func (c TrainErrorCode) String() string {
@@ -64,6 +71,10 @@ func (c TrainErrorCode) String() string {
 		return "capability chain has an unaligned pointer"
 	case ErrCapChainLoop:
 		return "capability chain loops"
+	case ErrInvalidSpeedStep:
+		return "invalid speed step"
+	case ErrNoSupportedLinkSpeeds:
+		return "no supported link speeds vector"
 	default:
 		return "unknown training error"
 	}
@@ -85,10 +96,22 @@ func (e *TrainError) Error() string {
 	return e.Code.String()
 }
 
+// Is reports whether target is a *TrainError with the same Code, so that errors.Is finds a
+// TrainError by its Code anywhere in an error tree, including in joined errors. A nil *TrainError
+// matches nothing.
+func (e *TrainError) Is(target error) bool {
+	t, ok := target.(*TrainError)
+	return ok && e != nil && t != nil && e.Code == t.Code
+}
+
 // needFieldCheck returns true if the error indicates a training timeout (ErrLinkUpTimeout)
 // which still requires running the speed check.
+//
+// It returns false if any error in err's tree indicates the link is down, e.g. a speed step
+// timeout joined with a link down found while restoring the speed, because a field read against a
+// device that is not responding is not a measurement.
 func needFieldCheck(err error) bool {
-	if err == nil {
+	if err == nil || isLinkDown(err) {
 		return false
 	}
 	var te *TrainError
@@ -97,20 +120,19 @@ func needFieldCheck(err error) bool {
 		case ErrLinkUpTimeout:
 			return true
 		case ErrNone, ErrSecPCIeExtCapNotFound, ErrSetSBRFailed, ErrDisableTimeout, ErrLinkDown, ErrDspUspSpeedMismatch,
-			ErrPCIeCapNotFound, ErrCapChainUnaligned, ErrCapChainLoop:
+			ErrPCIeCapNotFound, ErrCapChainUnaligned, ErrCapChainLoop, ErrInvalidSpeedStep, ErrNoSupportedLinkSpeeds:
 			return false
 		}
 	}
 	return false
 }
 
-// isLinkDown reports whether the error indicates the device stopped responding to config space
-// access, i.e. every read came back as all ones. Such an iteration says nothing about link speed
-// or width, so the train loop reports it separately from a genuine field mismatch.
+// isLinkDown reports whether any error in err's tree indicates the device stopped responding to
+// config space access, i.e. every read came back as all ones. Such an iteration says nothing about
+// link speed or width, so the train loop reports it separately from a genuine field mismatch.
 //
-// errors.As already returns false for a nil error. The te != nil check is still required: a
-// typed-nil *TrainError wrapped in a non-nil error interface matches errors.As.
+// errors.Is checks every error in the tree, so ErrLinkDown is found even when another TrainError
+// is joined before it.
 func isLinkDown(err error) bool {
-	var te *TrainError
-	return errors.As(err, &te) && te != nil && te.Code == ErrLinkDown
+	return errors.Is(err, &TrainError{Code: ErrLinkDown})
 }
