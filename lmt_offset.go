@@ -27,8 +27,8 @@ import (
 )
 
 const (
-	// Margin status checking interval is 3ms. At Gen5 speed, 3ms * 32gbps ~= 1E8 samples.
-	marginWait    = 3 * time.Millisecond
+	// Margin status checking interval is 500us. At Gen6 speed, 500us * 64gbps = 3.2E7 samples.
+	marginWait    = 500 * time.Microsecond
 	marginTimeout = 1000 * time.Millisecond // Margining setup spec timeout is 200ms.
 )
 

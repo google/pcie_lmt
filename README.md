@@ -5,7 +5,8 @@
 \
 The LMT (Lane Margin Test) checks the signal quality of the PCIe link. The test
 utilizes the PCIe Lane Margining at Receiver (LMR) feature. The LMR is specified
-in PCIe Base Spec 5.0 sections 4.2.13, 7.7.7 and 8.4.4. The LMR samples bits at each offset away from
+in PCIe Base Spec 5.0 sections 4.2.13, 7.7.7 and 8.4.4 (and Rev 6.4 sections
+4.2.18, 7.7.10 and 8.4.4). The LMR samples bits at each offset away from
 the eye center and checks against the expected value at the eye center. This
 test explores the error rate both timing-wise and voltage-wise. Here's a
 [PCIe LMT Overview presentation](https://docs.google.com/presentation/d/1a5xyykoV7n4HS6U9ag1mB2jeEvyaLT4BICTSh0fEqXA)
@@ -192,4 +193,11 @@ voltage_margins:  {
   voltage:  0.12346457
 }
 ```
+
+## Gen6 LMR & Spec Notes
+
+- **Status polling interval**: LMT polls `Margining Lane Status` every `500 µs` (`3.2E7` bits at 64 GT/s) to minimize dwell overshoot and improve `S_ERROR_OUT` dwell-time granularity.
+- **Parallel vs. sequential lane margining**: Lanes run in parallel only when `ind_error_sampler` is `true`. When `ind_error_sampler` is `false`, LMT margins lanes sequentially (round-robin, one point per lane) because Link Recovery error events are link-wide (PCIe Base Spec 6.4 §4.2.18.2) and concurrent margining can contaminate other lanes.
+- **Sample reporting method**: Per PCIe Base Spec §8.4.4, `sample_reporting_method = true` (sampling rate) and `false` (`MSampleCount`) are mutually exclusive. When `true`, LMT computes tested bits from `dwell_actual * ((rate + 1) / 64) * link_speed`.
+- **BER confidence level (Poisson)**: For `N = 2^(samples/3)` bits and at most `E` errors, the confidence level that true BER is below `BER_target` is `CL = 1 - sum_{k=0}^{E} (lambda^k * exp(-lambda) / k!)` with `lambda = N * BER_target`.
 
